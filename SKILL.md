@@ -1,6 +1,6 @@
 ---
 name: obsidian-plugin-lint
-description: Use when asked to lint, check, or review an Obsidian plugin's CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate".
+description: Use when asked to lint, check, or review an Obsidian plugin's CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate", "Unexpected browser feature", "Unexpected unknown type selector".
 ---
 
 # Obsidian Plugin Lint
@@ -18,6 +18,8 @@ Source: https://github.com/obsidianmd/eslint-plugin
 | Rule | What to check | Fix |
 |------|---------------|-----|
 | `no-static-styles-assignment` | `el.style.color = ...`, `el.style.cssText = ...` (any inline style via JS) | CSS class: `el.addClass('my-class')`. For dynamic values: `setCssProps(el, { '--my-var': value })` |
+| `no-unsupported-api` | An API whose current signature is newer than `minAppVersion` (e.g. `workspace.revealLeaf` returning `Promise<void>` requires 1.7.2) | Bump `manifest.json` `minAppVersion` to the version that introduced the API; see section below |
+| `obsidianmd/commands` (no plugin name) | `addCommand({ name })` repeats the plugin name (`"Open Day Echo timeline"` for plugin "Day Echo") | Drop the plugin name — Obsidian already prefixes it. `name: "Open timeline"` |
 | Sentence case | Button labels, settings headings, command names must use sentence case | Capitalize only first word and proper nouns |
 | No default hotkeys | `addCommand()` must not set `hotkeys: [...]` | Remove default hotkeys; let user configure |
 | No `innerHTML` | Any `el.innerHTML = ...` assignment (not just user input) | Use `el.createEl()`, `el.createDiv()`, `el.setText()` — innerHTML is unsafe regardless of source |
@@ -33,6 +35,8 @@ Source: https://github.com/obsidianmd/eslint-plugin
 | Full 6-digit hex | Shorthand hex `#fff`, `#aaa`, `#ccc`, `#888` | Expand to 6 digits: `#ffffff`, `#aaaaaa`, `#cccccc`, `#888888` |
 | No duplicate properties | Same property declared twice in one rule block (e.g. `position: fixed` repeated) | Remove the duplicate; keep the intended declaration |
 | Avoid `:has()` | Any `:has()` selector — broad selector invalidation hurts performance | Structural: target the matched element's own class. State-based: JS toggles a marker class, key CSS off it |
+| Browser feature compatibility | Properties only partially supported by Obsidian's Electron/Chromium version (`clip-path`, `column-count`, `box-decoration-break`, newer `text-decoration-*` sub-properties) | Add vendor prefixes or avoid the feature; see section below |
+| No unknown type selectors | Non-standard HTML element names in selectors (`webview`, `mjx-container`) | Use class selectors instead, or acknowledge as intentional third-party elements |
 
 ## Checking CSS for `!important`
 
@@ -308,6 +312,35 @@ if (node.instanceOf(Element)) { /* ... */ }
 
 ## TypeScript 类型安全
 
+### 避免 `as TFile` 强制转换 → 用 `instanceof TFile` 收窄
+
+机器人原文：`Avoid casting to 'TFile'. Use an 'instanceof TFile' check to safely narrow the type.` `getAbstractFileByPath` 返回 `TAbstractFile | null`，强转 `as TFile` 会绕过类型系统（实际可能是 `TFolder`），运行时不安全。正确做法是先 `instanceof TFile` 收窄，使变量在使用处**已经是** `TFile`，无需断言。
+
+> 注意：这与 popout DOM 规则里的 `node.instanceOf(Element)` 不同——`TFile`/`TFolder`/`WorkspaceLeaf` 是 Obsidian 模型类、不是 DOM 节点，用普通 `instanceof`。
+
+```typescript
+// ❌ — file 是 TAbstractFile | null，强转掩盖了它可能不是 TFile
+let file = this.app.vault.getAbstractFileByPath(path);
+if (!(file instanceof TFile)) {
+    file = await this.app.vault.create(path, "");   // create 返回 TFile
+}
+await this.app.workspace.getLeaf(false).openFile(file as TFile);
+
+// ✅ — 用一个声明为 TFile 的变量承接 create 的结果，全程无断言
+let file = this.app.vault.getAbstractFileByPath(path);
+let target: TFile;
+if (file instanceof TFile) {
+    target = file;
+} else {
+    target = await this.app.vault.create(path, "");
+}
+await this.app.workspace.getLeaf(false).openFile(target);
+```
+
+```bash
+grep -rn "as TFile\b\|as TFolder\b" src/ main.ts
+```
+
 ### `loadData()` 返回 `any` 导致不安全赋值
 
 `Plugin.loadData()` 返回 `Promise<any>`，直接赋值给强类型字段会触发 `@typescript-eslint/no-unsafe-assignment`：
@@ -318,6 +351,18 @@ this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 
 // ✅ 加类型断言
 this.settings = Object.assign({}, DEFAULT_SETTINGS, (await this.loadData()) as Partial<MyPluginSettings>);
+```
+
+`parseYaml()` 同理返回 `any`，直接赋值/return 触发同一条。先收到 `unknown`，再 `typeof === "object"` 收窄后断言：
+
+```typescript
+// ❌ — Unsafe assignment / return of an `any` value
+const parsed = parseYaml(trimmed);
+if (parsed && typeof parsed === "object") return parsed as BlockConfig;
+
+// ✅ 显式收为 unknown，收窄后再断言
+const parsed: unknown = parseYaml(trimmed);
+if (parsed && typeof parsed === "object") return parsed as BlockConfig;
 ```
 
 ### `.bind()` / `.call()` / `.apply()` 返回 `any` → 开 `strictBindCallApply`
@@ -374,6 +419,22 @@ function setLang(lang: 'auto' | 'zh' | 'en') {
 // ✅
 langOverride = lang === 'auto' ? null : lang;
 ```
+
+**非空断言 `x!` 的同名陷阱（lint 与本地 tsc 不同步）**：本仓库 `strictNullChecks: true`，本地 `tsc` 下 `WorkspaceLeaf | null` 的 `x!` 是必要的；但 Obsidian 提交机器人的 type-check **不开 strictNullChecks**，`null` 不被跟踪，`x` 已是非空类型，于是 `x!` 被判为多余而报同一条 `no-unnecessary-type-assertion`。
+
+陷阱在于：把布尔结果存进**单独的变量**（如 `canReuse`）后，TS 无法借它收窄原变量，所以才被迫写 `x!`。**正确修复不是删 `!`（删了本地严格 tsc 会报 null）**，而是在使用处把判空重新并入条件，让控制流自行收窄——既满足机器人（无断言），又满足本地严格 tsc（已收窄）：
+
+```typescript
+// ❌ — canReuse 已隐含 active 非空，但 TS 无法据此收窄 active，只能写 active!
+const active = this.app.workspace.getMostRecentLeaf();   // WorkspaceLeaf | null
+const canReuse = !!active && !(active as LeafInternal).view?.file;
+const leaf = canReuse ? active! : this.app.workspace.getLeaf('tab');
+
+// ✅ — 在三元条件里重并 `&& active`，true 分支 active 被收窄为 WorkspaceLeaf，无需断言
+const leaf = canReuse && active ? active : this.app.workspace.getLeaf('tab');
+```
+
+> 判断信号：报告里 `no-unnecessary-type-assertion` 指向一个 `x!`，而本地 `tsc -noEmit` 却不报错（甚至删掉 `!` 后本地 tsc 反而报 null）——这就是 lint 与本地 strict 配置不同步，用「重并判空收窄」而非「删断言」修复。
 
 ### `.replace()` 回调参数未标注类型
 
@@ -455,7 +516,7 @@ grep -n 'eslint-disable' src/*.ts | grep -v ' -- '
 const re = /[\x00-\x1f]/;
 
 // ✅
-const re = /[ -]/;
+const re = /[\u0000-\u001f]/;
 ```
 
 **多余转义**：`\S` 在字符类 `[...]` 外部是合法的，但某些位置会触发 `no-useless-escape`。去掉多余的反斜杠：
@@ -468,8 +529,140 @@ const re = /[\.\s]/;
 const re = /[.\s]/;
 ```
 
+**模板字符串里的正则**：在 TypeScript template literal 里嵌入 HTML/JS 脚本时，`\S` 会被模板字符串引擎求值为 `S`（backslash 被忽略），导致生成错误的正则。ESLint 同样报 `no-useless-escape`。必须写成 `\\S` 才能在输出字符串里保留 `\S`：
+
+```typescript
+// ❌ — \S in template literal → becomes S in output, regex broken
+const script = `var m = code.className.match(/language-(\S+)/);`;
+
+// ✅ — \\S in template literal → becomes \S in output
+const script = `var m = code.className.match(/language-(\\S+)/);`;
+```
+
 ```bash
 grep -n 'eslint.*no-useless-escape\|\\\\[^nrtuvxuU0-9$()*+.?[\]^{|}\\]' src/*.ts
+```
+
+### `no-unsafe-return` — 从有类型函数返回 `any`
+
+函数声明了返回类型（如 `: string`），但实际返回了 `any` 值，触发 `no-unsafe-return`。常见来源：Obsidian `FrontMatterCache` 中的 frontmatter 属性（类型为 `Record<string, any>`）。
+
+```typescript
+// ❌ — frontmatter.share_link 是 any，返回 any 但函数声明返回 string
+private getShareLink(file: TFile): string {
+    return this.app.metadataCache.getFileCache(file)?.frontmatter?.share_link ?? "";
+}
+
+// ✅ — 加 as string | undefined 收窄类型
+private getShareLink(file: TFile): string {
+    return (this.app.metadataCache.getFileCache(file)?.frontmatter?.["share_link"] as string | undefined) ?? "";
+}
+```
+
+```bash
+grep -n 'frontmatter\?\.' src/*.ts main.ts
+```
+
+### `no-floating-promises` — Promise 未被处理
+
+onClick / 事件回调是同步函数，无法 `await`。在其中调用 `async` 方法时，返回的 Promise 被"悬空"，触发 `Promises must be awaited...`。用 `void` 显式标记 fire-and-forget：
+
+```typescript
+// ❌ — doPublish returns Promise, unhandled inside sync onClick
+menu.addItem(item => item.onClick(() => {
+    this.doPublish(file, subNotes);
+}));
+
+// ✅
+menu.addItem(item => item.onClick(() => {
+    void this.doPublish(file, subNotes);
+}));
+```
+
+```bash
+grep -n 'this\.\(doPublish\|doUnpublish\|exportFile\|saveSettings\)(' src/*.ts main.ts
+```
+
+### `FrontMatterCache` 的 `any` 属性
+
+Obsidian 的 `FrontMatterCache` 扩展 `Record<string, any>`，所有动态字段均为 `any`。访问这些字段会触发 `no-unsafe-member-access` / `no-unsafe-assignment`。
+
+```typescript
+// ❌ — frontmatter.share_link 是 any
+const shareLink = cache?.frontmatter?.share_link ?? "";
+
+// ✅ — 用 as 收窄
+const shareLink = (cache?.frontmatter?.["share_link"] as string | undefined) ?? "";
+
+// ✅ — processFrontMatter 回调里：显式标注参数类型
+await fileManager.processFrontMatter(file, (fm: Record<string, unknown>) => {
+    fm["share_link"] = url;
+    delete fm["share_link"];
+});
+```
+
+### 第三方 SDK 无类型声明 → 创建 `.d.ts`
+
+`ali-oss` 等没有官方 TypeScript 声明的 SDK，导致 `new OSS(...)` 及所有方法调用被标记 `no-unsafe-construction` / `no-unsafe-call` / `no-unsafe-member-access`。根治方法：在 `src/` 下建一个最小 `.d.ts` 声明文件，只声明实际用到的接口和方法：
+
+```typescript
+// src/ali-oss.d.ts
+declare module "ali-oss" {
+  interface OSSListParams {
+    prefix?: string;
+    delimiter?: string;
+    "max-keys"?: number;
+    marker?: string;
+  }
+  interface OSSListResult {
+    objects?: { name: string }[];
+    prefixes?: string[];
+    isTruncated?: boolean;
+    nextMarker?: string;
+  }
+  interface OSSPutOptions { mime?: string; }
+  interface OSSDeleteMultiOptions { quiet?: boolean; }
+  interface OSSConfig {
+    region: string;
+    accessKeyId: string;
+    accessKeySecret: string;
+    bucket: string;
+    authorizationV4?: boolean;
+  }
+  class OSS {
+    constructor(config: OSSConfig);
+    list(params: OSSListParams, options?: object): Promise<OSSListResult>;
+    put(key: string, data: Buffer, options?: OSSPutOptions): Promise<void>;
+    delete(key: string): Promise<void>;
+    deleteMulti(keys: string[], options?: OSSDeleteMultiOptions): Promise<void>;
+  }
+  export = OSS;
+}
+```
+
+一旦类型声明存在，所有 `no-unsafe-*` 警告消失，还可以删除手写的 `as { objects?: ... }` 强制类型转换（它们变成 `no-unnecessary-type-assertion`）。
+
+**catch 变量**：tsconfig 不含 `useUnknownInCatchVariables` 时，`catch(e)` 的 `e` 是 `any`，触发 "Unsafe assignment of an error typed value"。对每个 catch 加 `: unknown`：
+
+```typescript
+// ❌
+} catch (err) { console.warn(err); }
+
+// ✅
+} catch (err: unknown) { console.warn(err); }
+```
+
+### 废弃 API → eslint-disable 或迁移
+
+Obsidian 1.13.0 将 `PluginSettingTab.display()` 标为 `@deprecated`，推荐改用 `getSettingDefinitions()`。迁移需要完整重写 Settings Tab（声明式 API）。在迁移前，用带说明的 `eslint-disable-next-line` 压制警告：
+
+```typescript
+// ❌
+this.display();
+
+// ✅ — suppress until the tab is migrated to getSettingDefinitions()
+// eslint-disable-next-line @typescript-eslint/no-deprecated -- PluginSettingTab.display() deprecated in 1.13.0; migrate to getSettingDefinitions() when refactoring settings
+this.display();
 ```
 
 ## 依赖项检查（submission bot 扫描）
@@ -523,6 +716,21 @@ overrides:
 |-----|-------------|
 | `FileManager.processFrontMatter` | 1.4.4 |
 | `Editor.cm` (CodeMirror 6) | 0.14.0 |
+| `Workspace.revealLeaf` 返回 `Promise<void>`（可 await） | 1.7.2 |
+| `WorkspaceLeaf.isDeferred` / `loadIfDeferred` | 1.7.2 |
+| `Vault.getFileByPath` / `getFolderByPath` | 1.5.7 |
+
+**`obsidianmd/no-unsupported-api`（机器人原文：`Uses Obsidian APIs newer than the declared minAppVersion`）**：这条不是看 API 是否存在，而是看你依赖的**签名版本**。典型陷阱：`revealLeaf` 自古就有，但「返回 `Promise<void>`、可被 `await`」是 1.7.2 随 deferred views 引入的——`minAppVersion < 1.7.2` 时调用就报此条。
+
+```typescript
+// ❌ minAppVersion 1.5.7 + revealLeaf 现在返回 Promise<void> → no-unsupported-api（且 no-floating-promises）
+this.app.workspace.revealLeaf(leaf);
+
+// ✅ 把 minAppVersion 升到引入该签名的版本，并 await（顺带消除 floating promise）
+await this.app.workspace.revealLeaf(leaf);   // manifest.json: "minAppVersion": "1.7.2"
+```
+
+> 关键：`no-unsupported-api` **只能靠升 `minAppVersion`（或换用旧版兼容 API）修复**——加 `void`/`await` 只解决 floating-promise，不解决本条。同一行同时报这两条时，先升 minAppVersion，再 await。
 
 ```bash
 # 找出 processFrontMatter 调用
@@ -579,6 +787,139 @@ jobs:
 ```
 
 缺少任一项均视为违规，需补全。
+
+## Checking CSS for browser feature compatibility
+
+**Submission bot warning:** `Unexpected browser feature "X" is only partially supported by Obsidian Y.Z`
+
+The bot runs [Browserslist](https://browsersl.ist/) / [caniuse](https://caniuse.com/) checks against the Electron version bundled in the target `minAppVersion`. A "partially supported" warning means the feature works in some Electron builds but not all, or only behind a flag.
+
+Known partially-supported features in Obsidian 1.6.5 / Electron 27:
+
+| Feature key | Affected CSS properties | Fix |
+|-------------|------------------------|-----|
+| `css-clip-path` | `clip-path` | Add `-webkit-clip-path` fallback; or avoid on non-critical elements |
+| `css-masks` | `mask-image`, `mask`, `mask-size`, `mask-position`, etc. | Add the `-webkit-mask-*` prefixed form immediately before each standard property |
+| `multicolumn` | `column-count`, `column-width`, `column-gap`, `column-rule` | Add `-webkit-column-*` prefixed fallbacks |
+| `css-boxdecorationbreak` | `box-decoration-break` | Add `-webkit-box-decoration-break` |
+| `css-text-indent` | `text-indent` with `each-line`/`hanging` keywords | Use plain `text-indent: <length>` without keywords; or drop |
+| `text-decoration` | `text-decoration-thickness`, `text-underline-offset`, `text-decoration-skip-ink`, `text-underline-position` | These newer sub-properties may not render in older Electron; add fallback `text-decoration: underline` and treat sub-properties as progressive enhancement |
+
+```bash
+# Find affected properties
+grep -rn 'clip-path\|mask-image\|mask:\|column-count\|column-width\|box-decoration-break\|text-indent.*each-line\|text-indent.*hanging\|text-decoration-thickness\|text-underline-offset\|text-decoration-skip-ink\|text-underline-position' styles.css theme/
+```
+
+For each hit, either add the vendor-prefixed form immediately before the standard property, or drop it if the visual effect is non-essential:
+
+```css
+/* Before */
+.my-el { clip-path: inset(0 round 4px); }
+
+/* After */
+.my-el {
+  -webkit-clip-path: inset(0 round 4px);
+  clip-path: inset(0 round 4px);
+}
+```
+
+## Checking CSS for unknown type selectors
+
+**Submission bot warning:** `Unexpected unknown type selector "X"`
+
+The linter runs with a known set of HTML element names. Custom/non-standard element names (from Electron, MathJax, or other renderers) are flagged as unknown.
+
+Common examples:
+
+| Selector | Source | Fix |
+|----------|--------|-----|
+| `webview` | Electron `<webview>` element | Prefer targeting by class or parent context; if unavoidable, use an `/* stylelint-disable-next-line selector-type-no-unknown */` comment |
+| `mjx-container` | MathJax v3 output element | Same — prefer wrapping class or stylelint disable comment |
+
+```bash
+grep -rn 'webview\|mjx-container' styles.css theme/
+```
+
+If the selector is intentional (you're styling a known third-party element), suppress per-line with a comment rather than globally:
+
+```css
+/* stylelint-disable-next-line selector-type-no-unknown */
+webview { display: flex; }
+```
+
+## Repo hygiene: do not track Obsidian's CSS in the plugin repo
+
+**Root cause:** The submission bot lints **all CSS files found in the GitHub repository**, not just the files in the release zip. If `app.css` (Obsidian's own compiled CSS, ~20 000 lines) is checked into the plugin repo — even for local development reference — the bot will scan it and report every violation it contains, all attributed to your submission.
+
+**Diagnosis:**
+
+```bash
+git ls-files "*.css"       # list all tracked CSS files
+wc -l *.css                # any file with thousands of lines is suspicious
+```
+
+If `app.css`, `obsidian.css`, or any other large Obsidian-internal CSS file appears in `git ls-files`, it must be untracked.
+
+**Fix:**
+
+```bash
+# 1. Add to .gitignore
+echo "app.css" >> .gitignore
+
+# 2. Remove from git index (keeps the local file, just stops tracking it)
+git rm --cached app.css
+```
+
+Then commit. The local `app.css` remains for development but is no longer visible to the bot.
+
+Similarly, any unrelated CSS snippet files that are not part of the plugin's runtime output (`customer-ui.css`, `snippets/*.css`, etc.) should be either gitignored or moved outside the plugin repo — unless they are intentionally distributed as part of the plugin.
+
+## Security & Behavior Review（Submission Bot 行为审查）
+
+Obsidian submission bot 对插件行为按三个级别分类：**Warning**（会受到人工审查）、**Recommendation**（知悉即可）、**Pass**（通过）。
+
+| 级别 | 行为 | 触发模式 | 修复方向 |
+|------|------|----------|----------|
+| Warning | Direct Filesystem Access | `import * as fs from 'fs'`、`import { readFileSync } from 'fs'` | 对 vault 内路径改用 `app.vault.adapter`（`write`、`writeBinary`、`mkdir`）；对 vault 外路径（用户配置的导出路径等）`fs` 是唯一选项，需在注释中说明意图 |
+| Warning | Shell Execution | `import { exec } from 'child_process'`、`require('child_process')` | 无法接受——移除；若确实必要需充分说明 |
+| Recommendation | Vault Enumeration | `vault.getFiles()`、`vault.getMarkdownFiles()`、`vault.getAllLoadedFiles()` | 通常为必要功能（链接解析、搜索）；确认范围最小化，无需移除 |
+| Recommendation | Clipboard Access | `navigator.clipboard.writeText()`、`navigator.clipboard.readText()` | 通常为 UX 功能（复制链接、代码块）；确认只在用户触发时调用，无需移除 |
+| Pass | Vault Read | `vault.read()`、`vault.cachedRead()` | 无需处理 |
+
+### 检查命令
+
+```bash
+# Direct Filesystem Access
+grep -rn "from 'fs'\|from \"fs\"\|require('fs')\|require(\"fs\")" src/ main.ts
+
+# Shell Execution
+grep -rn "child_process\|exec(\|spawn(" src/ main.ts
+
+# Vault Enumeration
+grep -rn "vault\.getFiles\|vault\.getMarkdownFiles\|vault\.getAllLoadedFiles" src/ main.ts
+
+# Clipboard Access
+grep -rn "navigator\.clipboard\|Clipboard" src/ main.ts
+```
+
+### Warning: Direct Filesystem Access 的修复决策
+
+```typescript
+// ✅ vault 内路径 → 用 Obsidian adapter API，不触发 Warning
+import { FileSystemAdapter } from 'obsidian';
+const adapter = app.vault.adapter as FileSystemAdapter;
+await adapter.write('relative/to/vault.md', content);
+await adapter.mkdir('relative/dir');
+
+// ✅ vault 外路径（用户配置的外部导出目录）→ fs 是唯一选项，加注释说明
+// fs is required here: exportRoot is a user-configured absolute path outside the vault;
+// app.vault.adapter only resolves paths relative to the vault root.
+import * as fs from "fs";
+fs.writeFileSync(path.join(exportRoot, 'file.html'), content, 'utf8');
+fs.mkdirSync(dir, { recursive: true });
+```
+
+**判断原则**：如果写入目标是用户选择的 vault 外目录（如"导出到桌面"），`fs` 是合理且必要的，审核人通常会批准——但代码中需有注释说明理由，且不应读取任意路径。
 
 ## Report Format
 
