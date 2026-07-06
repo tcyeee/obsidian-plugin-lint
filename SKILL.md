@@ -1,6 +1,6 @@
 ---
 name: obsidian-plugin-lint
-description: Use when asked to lint, check, or review an Obsidian plugin's CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate", "Unexpected browser feature", "Unexpected unknown type selector".
+description: Use when asked to lint, check, or review an Obsidian plugin's CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate", "Unexpected browser feature", "Unexpected unknown type selector". Also handles the "/obsidian-plugin-publish [version]" release workflow — commit outstanding work, generate version.md from git history since the last release tag, bump manifest.json/package.json, tag, and push to trigger the release pipeline. Triggers on "/obsidian-plugin-publish", "发布插件", "打个 release", "bump version and tag".
 ---
 
 # Obsidian Plugin Lint
@@ -920,6 +920,81 @@ fs.mkdirSync(dir, { recursive: true });
 ```
 
 **判断原则**：如果写入目标是用户选择的 vault 外目录（如"导出到桌面"），`fs` 是合理且必要的，审核人通常会批准——但代码中需有注释说明理由，且不应读取任意路径。
+
+## `/obsidian-plugin-publish [version]` Release Command
+
+Runs the version-bump-and-release workflow for the current Obsidian plugin repo. `version` is
+optional — an explicit argument (e.g. `/obsidian-plugin-publish 1.2.0`) sets the new tag exactly;
+omitting it auto-increments the patch component of the previous version (`0.1.12` → `0.1.13`).
+
+This command **pushes a tag**, which is a shared, hard-to-reverse action that kicks off CI release
+automation — confirm the resolved version number and target commit with the user before the final
+push (step 4), per the general git-safety rules: never force-push, never skip hooks, and only push
+what this workflow explicitly calls for.
+
+### Step 1 — Commit outstanding work (skip if clean)
+
+```bash
+git status --porcelain
+```
+
+If this is non-empty, ask the user whether to commit it before releasing (do not decide unilaterally
+which files to stage — follow the normal commit workflow: review the diff, draft a message summarizing
+the "why"). If the user declines, proceed anyway — the tag will simply be cut from the current HEAD,
+and the uncommitted work stays out of the release. If the tree is already clean, skip this step
+silently.
+
+### Step 2 — Generate `version.md` from git history since the last release
+
+1. Read the **previous** version number out of the root `manifest.json`'s `version` field (this repo
+   treats `manifest.json` as the version source of truth, per its `CLAUDE.md`).
+2. Find the matching tag. This repo's tags are bare version numbers, no `v` prefix (`0.1.12`, not
+   `v0.1.12`) — check that form first, then `v<version>` as a fallback for repos that do prefix:
+   ```bash
+   PREV=$(node -pe "require('./manifest.json').version")
+   TAG="$PREV"
+   git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || TAG="v$PREV"
+   git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || TAG=""   # no matching tag found
+   ```
+   If no tag matches (e.g. first-ever release), say so and fall back to the full log (`git log
+   --oneline`) rather than silently guessing a range.
+3. Overwrite the root `version.md` with the new version heading and every commit from that tag to
+   `HEAD`:
+   ```bash
+   {
+     echo "# $NEW_VERSION"
+     echo
+     git log "$TAG"..HEAD --pretty=format:'- %s (%h)'
+   } > version.md
+   ```
+   (`$NEW_VERSION` is resolved in step 3 below — compute it first if writing this in one pass.)
+
+### Step 3 — Bump version fields and create the tag
+
+1. Resolve `$NEW_VERSION`: the user-supplied argument if given, otherwise `$PREV` with its patch
+   component incremented by one.
+2. Update the `version` field in `manifest.json`, and in `package.json` too if that file exists and
+   has one — a targeted substitution (not a JSON re-serialize, to avoid reformatting the file):
+   ```bash
+   sed -i '' -E "s/\"version\": \"[^\"]+\"/\"version\": \"$NEW_VERSION\"/" manifest.json
+   [ -f package.json ] && sed -i '' -E "s/\"version\": \"[^\"]+\"/\"version\": \"$NEW_VERSION\"/" package.json
+   ```
+3. Stage `manifest.json`, `package.json` (if touched), and `version.md`, then commit — match this
+   repo's existing convention for these commits (e.g. `chore(release): bump version to $NEW_VERSION`,
+   visible in its own `git log`).
+4. Tag that commit with the bare version number: `git tag "$NEW_VERSION"`.
+
+### Step 4 — Push and hand off to CI
+
+```bash
+git push origin HEAD    # the version-bump commit, so main doesn't diverge from what's tagged
+git push origin "$NEW_VERSION"
+```
+
+Pushing the tag is what triggers the release pipeline (e.g. a GitHub Actions workflow gated on
+`on: push: tags:`, see [Release 工作流检查（GitHub Actions）](#release-工作流检查github-actions) above).
+Report the pushed tag name and that CI has been triggered, then stop — do not wait on or poll the CI
+run as part of this command.
 
 ## Report Format
 
