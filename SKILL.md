@@ -830,6 +830,50 @@ jobs:
 
 缺少任一项均视为违规，需补全。
 
+### Populating release notes from the tag message
+
+不同项目的发布机制不统一——有的直接调 `gh release create`，有的用第三方 Action（如
+`softprops/action-gh-release`）。为了让"draft release 自动带上本次更新内容"这件事能跨项目复用，
+约定把决策点放在本地打 tag 那一步（见上面 Step 2/3）：notes 的实际内容在本地生成，写进
+**annotated tag 的 message**；CI 端只需要把这条 tag message 原样读出来，完全不用关心它最初来自哪个
+changelog 文件、标题格式长什么样。
+
+**先探测这个仓库用哪种发布机制，不要假设：**
+
+```bash
+grep -rl "gh release create\|action-gh-release" .github/workflows/*.yml
+```
+
+**若用 `gh release create`（原生 CLI）**——取出 annotated tag 的正文，写入临时文件后传给
+`--notes-file`；如果 tag 没有内容（比如遗留的 lightweight tag），fallback 到 `--generate-notes`
+（GitHub 按 commit/PR 自动生成），保证不会因为读不到 notes 而报错或产出空 body：
+
+```yaml
+- name: Create release
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  run: |
+    tag="${GITHUB_REF#refs/tags/}"
+    notes="$(git tag -l --format='%(contents)' "$tag")"
+
+    if [ -n "$notes" ]; then
+      echo "$notes" > /tmp/release-notes.md
+      gh release create "$tag" --title="$tag" --draft --notes-file /tmp/release-notes.md <assets...>
+    else
+      gh release create "$tag" --title="$tag" --draft --generate-notes <assets...>
+    fi
+```
+
+（`<assets...>` 替换为该项目实际发布的文件列表，例如 `main.js manifest.json styles.css`。）
+
+**若用 `softprops/action-gh-release`**——该 Action 在没有显式设置 `body` / `body_path` /
+`generate_release_notes: true` 时，通常会默认用 annotated tag 的 message 作为 release body；只需确认
+项目没有把这三个字段中的任何一个写死覆盖掉即可，不一定需要改动。改之前用该 Action 当前锁定的版本号
+核实一下这条默认行为仍然成立，而不是直接假设。
+
+**改之前先确认这项工作是否已经做过**——如果 workflow 里已经有类似的 tag-message 读取逻辑，不要重复
+添加。
+
 ## Checking CSS for browser feature compatibility
 
 **Submission bot warning:** `Unexpected browser feature "X" is only partially supported by Obsidian Y.Z`
@@ -1019,12 +1063,12 @@ the "why"). If the user declines, proceed anyway — the tag will simply be cut 
 and the uncommitted work stays out of the release. If the tree is already clean, skip this step
 silently.
 
-### Step 2 — Generate `version.md` from git history since the last release
+### Step 2 — Generate a changelog entry since the last release, and capture a notes fragment for the tag
 
-1. Read the **previous** version number out of the root `manifest.json`'s `version` field (this repo
-   treats `manifest.json` as the version source of truth, per its `CLAUDE.md`).
-2. Find the matching tag. This repo's tags are bare version numbers, no `v` prefix (`0.1.12`, not
-   `v0.1.12`) — check that form first, then `v<version>` as a fallback for repos that do prefix:
+1. Read the **previous** version number out of the root `manifest.json`'s `version` field (or wherever
+   that repo's own `CLAUDE.md` says the version lives).
+2. Find the matching tag. Tags are commonly bare version numbers (`0.1.12`, not `v0.1.12`) — check that
+   form first, then `v<version>` as a fallback for repos that do prefix:
    ```bash
    PREV=$(node -pe "require('./manifest.json').version")
    TAG="$PREV"
@@ -1033,16 +1077,29 @@ silently.
    ```
    If no tag matches (e.g. first-ever release), say so and fall back to the full log (`git log
    --oneline`) rather than silently guessing a range.
-3. Overwrite the root `version.md` with the new version heading and every commit from that tag to
-   `HEAD`:
+3. **Detect the changelog file, if any — don't assume filename or heading style.** This skill runs
+   against many different plugin repos, each with its own (or no) convention. Check the repo root for
+   `version.md`, then `CHANGELOG.md`, then `CHANGES.md`. If one exists, read its most recent entry to
+   learn the heading pattern already in use (`## Version X.Y.Z`, `## [X.Y.Z]`, bilingual bullets or
+   not, etc.) and match it exactly — never impose a different style on an existing file. If none
+   exists, skip straight to step 5 (no changelog to write, but a notes fragment is still needed).
+4. If a changelog file was found, write the new entry into it using the detected style, in whatever
+   position new entries go (usually right after the top intro block, before the previous latest entry
+   — check where that boundary falls in the existing file).
+5. **Save the notes fragment for the tag** — this is what makes release notes portable across CI setups
+   without CI having to re-parse any particular changelog format (see [Populating release notes from
+   the tag message](#populating-release-notes-from-the-tag-message) below). Write just the new entry's
+   body (no heading line, trimmed of leading/trailing blank lines) to a scratch file:
    ```bash
-   {
-     echo "# $NEW_VERSION"
-     echo
-     git log "$TAG"..HEAD --pretty=format:'- %s (%h)'
-   } > version.md
+   NOTES_FILE="$(mktemp)"
+   # write the section you just composed for $NEW_VERSION into $NOTES_FILE
    ```
-   (`$NEW_VERSION` is resolved in step 3 below — compute it first if writing this in one pass.)
+   If step 3 found no changelog file, fall back to the raw commit list as the fragment instead:
+   ```bash
+   git log "$TAG"..HEAD --pretty=format:'- %s (%h)' > "$NOTES_FILE"
+   ```
+   (`$NEW_VERSION` is resolved in step 3 of the next section — compute it first if writing this in one
+   pass.)
 
 ### Step 3 — Bump version fields and create the tag
 
@@ -1054,10 +1111,21 @@ silently.
    sed -i '' -E "s/\"version\": \"[^\"]+\"/\"version\": \"$NEW_VERSION\"/" manifest.json
    [ -f package.json ] && sed -i '' -E "s/\"version\": \"[^\"]+\"/\"version\": \"$NEW_VERSION\"/" package.json
    ```
-3. Stage `manifest.json`, `package.json` (if touched), and `version.md`, then commit — match this
-   repo's existing convention for these commits (e.g. `chore(release): bump version to $NEW_VERSION`,
-   visible in its own `git log`).
-4. Tag that commit with the bare version number: `git tag "$NEW_VERSION"`.
+3. Stage `manifest.json`, `package.json` (if touched), and the changelog file (if one was written),
+   then commit — match this repo's existing convention for these commits (e.g. `chore(release): bump
+   version to $NEW_VERSION`, visible in its own `git log`).
+4. Tag that commit as an **annotated** tag, using the notes fragment from Step 2 as the tag message —
+   this is what lets CI hand back real release notes without depending on any particular changelog file
+   format:
+   ```bash
+   git tag -a "$NEW_VERSION" -F "$NOTES_FILE"
+   ```
+   If `$NOTES_FILE` ended up empty for any reason, still create an annotated tag (not a bare/lightweight
+   one) with a minimal fallback message, so CI logic that reads the tag's contents always finds
+   something rather than silently producing an empty release body:
+   ```bash
+   git tag -a "$NEW_VERSION" -m "Release $NEW_VERSION"
+   ```
 
 ### Step 4 — Push and hand off to CI
 
@@ -1067,9 +1135,11 @@ git push origin "$NEW_VERSION"
 ```
 
 Pushing the tag is what triggers the release pipeline (e.g. a GitHub Actions workflow gated on
-`on: push: tags:`, see [Release 工作流检查（GitHub Actions）](#release-工作流检查github-actions) above).
-Report the pushed tag name and that CI has been triggered, then stop — do not wait on or poll the CI
-run as part of this command.
+`on: push: tags:`, see [Release 工作流检查（GitHub Actions）](#release-工作流检查github-actions) and
+[Populating release notes from the tag message](#populating-release-notes-from-the-tag-message) below).
+If that workflow has been wired to read the annotated tag's message, the draft release body fills in
+automatically — no manual editing on GitHub needed. Report the pushed tag name and that CI has been
+triggered, then stop — do not wait on or poll the CI run as part of this command.
 
 ## Report Format
 
