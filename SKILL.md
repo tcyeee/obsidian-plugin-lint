@@ -1,6 +1,6 @@
 ---
 name: obsidian-plugin-lint
-description: Use when asked to lint, check, or review an Obsidian plugin's CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate", "Unexpected browser feature", "Unexpected unknown type selector". Also handles the "/obsidian-plugin-publish [version]" release workflow — commit outstanding work, generate version.md from git history since the last release tag, bump manifest.json/package.json, tag, and push to trigger the release pipeline. Triggers on "/obsidian-plugin-publish", "发布插件", "打个 release", "bump version and tag".
+description: Use when asked to lint, check, or review an Obsidian plugin's CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate", "Unexpected browser feature", "Unexpected unknown type selector", "Unsafe assignment to innerHTML", "Sets styles directly instead of using CSS classes", "Unsafe call of an error or any typed value", "This assertion is unnecessary since the receiver accepts the original type of the expression". Also handles the "/obsidian-plugin-publish [version]" release workflow — commit outstanding work, generate version.md from git history since the last release tag, bump manifest.json/package.json, tag, and push to trigger the release pipeline. Triggers on "/obsidian-plugin-publish", "发布插件", "打个 release", "bump version and tag".
 ---
 
 # Obsidian Plugin Lint
@@ -17,7 +17,7 @@ Source: https://github.com/obsidianmd/eslint-plugin
 
 | Rule | What to check | Fix |
 |------|---------------|-----|
-| `no-static-styles-assignment` | `el.style.color = ...`, `el.style.cssText = ...` (any inline style via JS) | CSS class: `el.addClass('my-class')`. For dynamic values: `setCssProps(el, { '--my-var': value })` |
+| `no-static-styles-assignment` | `el.style.color = ...`, `el.style.cssText = ...`, `el.style.display = ...` (any inline style via JS) | CSS class: `el.addClass('my-class')`. For dynamic values: `setCssProps(el, { '--my-var': value })` or `setCssStyles(el, { display: value })` |
 | `no-unsupported-api` | An API whose current signature is newer than `minAppVersion` (e.g. `workspace.revealLeaf` returning `Promise<void>` requires 1.7.2) | Bump `manifest.json` `minAppVersion` to the version that introduced the API; see section below |
 | `obsidianmd/commands` (no plugin name) | `addCommand({ name })` repeats the plugin name (`"Open Day Echo timeline"` for plugin "Day Echo") | Drop the plugin name — Obsidian already prefixes it. `name: "Open timeline"` |
 | Sentence case | Button labels, settings headings, command names must use sentence case | Capitalize only first word and proper nouns |
@@ -173,18 +173,53 @@ Implement as a `Feature` (apply/remove) so listeners are torn down on unload. Fo
 grep -n '\.style\.' src/*.ts
 ```
 
-Any hit that assigns a value (`.style.color =`, `.style.display =`, `.style.cssText =`) is a violation. Use a CSS class for static values; for dynamic CSS properties use `setCssProps`:
+Any hit that assigns a value (`.style.color =`, `.style.display =`, `.style.cssText =`) is a violation — the bot's message is `Sets styles directly instead of using CSS classes, setCssProps, or setCssStyles`. Use a CSS class for static values; for dynamic CSS properties use `setCssProps` (custom properties) or `setCssStyles` (standard properties):
 
 ```typescript
 // ❌
 el.style.cssText = 'position: absolute; top: 0';
 el.style.color = 'red';
+el.style.display = isReading ? '' : 'none';
 
-// ✅ static
+// ✅ static — toggle a class instead of a direct property assignment
 el.addClass('my-positioned-el');
+el.toggleClass('is-hidden', !isReading);
 
-// ✅ dynamic
+// ✅ dynamic custom property
 setCssProps(el, { '--offset-top': `${y}px` });
+
+// ✅ dynamic standard property (when a class can't express the value)
+setCssStyles(el, { display: isReading ? '' : 'none' });
+```
+
+## Checking JS/TS for innerHTML assignment
+
+**Submission bot messages (both can fire on the same line):** `Unsafe assignment to innerHTML` (Error) and `Do not write to DOM directly using innerHTML/outerHTML property` (Warning).
+
+`el.innerHTML = ...` is flagged twice, for two different reasons, but fixed by the same change: (1) the Obsidian rule bans `innerHTML`/`outerHTML` outright regardless of content, and (2) `HTMLElement.innerHTML`'s setter type is `string`, so assigning any non-literal (a template built from another `any`/untyped value, a variable typed loosely) also trips generic TS `no-unsafe-assignment`. A hardcoded SVG/HTML string literal still trips (1) even though it can't trip (2).
+
+```typescript
+// ❌ — src/layout/EditorStatusManager.ts:25 (real example from this repo)
+const LOCK_SVG = `<svg xmlns="..." ...>...</svg>`;
+this.statusBarItem.innerHTML = LOCK_SVG;
+
+// ✅ — parse the SVG once and clone the node instead of re-assigning innerHTML
+const LOCK_SVG_EL = new DOMParser().parseFromString(LOCK_SVG, 'image/svg+xml').documentElement;
+this.statusBarItem.appendChild(LOCK_SVG_EL.cloneNode(true));
+```
+
+For plain text/element trees (the common case), skip the parser entirely and build with Obsidian's DOM helpers:
+
+```typescript
+// ❌
+el.innerHTML = `<span class="label">${text}</span>`;
+
+// ✅
+el.createSpan({ cls: 'label', text });
+```
+
+```bash
+grep -rn '\.innerHTML\s*=\|\.outerHTML\s*=' src/ main.ts
 ```
 
 ## Settings UI 规范
@@ -477,6 +512,40 @@ const leaf = canReuse && active ? active : this.app.workspace.getLeaf('tab');
 ```
 
 > 判断信号：报告里 `no-unnecessary-type-assertion` 指向一个 `x!`，而本地 `tsc -noEmit` 却不报错（甚至删掉 `!` 后本地 tsc 反而报 null）——这就是 lint 与本地 strict 配置不同步，用「重并判空收窄」而非「删断言」修复。
+
+**第三种变体——"receiver accepts the original type" 而非 "does not change the type"**：机器人有时会用不同措辞报同一条规则：`This assertion is unnecessary since the receiver accepts the original type of the expression.` 这个变体不是说表达式自身经控制流收窄后已是目标类型（那是上面两种），而是说**接收这个值的位置**（返回值类型、参数类型、赋值目标的字段类型）本来就能接受断言前的类型，断言完全不影响任何一方——常见于 `as unknown as X` 这类双重转换，用来绕过内部/非官方类型的结构不兼容，但如果 getter 的声明返回类型本身就是 `X | null`，转换根本没必要：
+
+```typescript
+// ❌ — src/single-page/GraphSidebarManager.ts:28（同款还出现在 ResponsiveSidebarManager.ts:51）
+// getter 的声明返回类型是 WorkspaceSidedock | null，可它接收的正是转换前的值，转换是多余的
+private get leftSplit(): WorkspaceSidedock | null {
+    return (this.app.workspace.leftSplit as unknown as WorkspaceSidedock) ?? null;
+}
+
+// ✅ — 若真的需要绕开官方类型定义的结构差异，直接标注变量类型即可，不必双重转换
+private get leftSplit(): WorkspaceSidedock | null {
+    const split = this.app.workspace.leftSplit;
+    return split ?? null;
+}
+```
+
+> 判断信号：断言链路是 `as unknown as X`，且断言结果被直接 `return`/传参/赋值给一个类型早已声明为兼容 `X`（或更宽）的位置——先看接收方的类型声明，而不是表达式自身的控制流收窄。
+
+### `no-unsafe-call` — 调用一个 `any`/`error` 类型的值
+
+机器人原文：`Unsafe call of an 'error' or 'any' typed value.` 触发于把一个未标注类型（因而退化为 `any`）的值当函数调用，常见来源与 [`.bind()`/`.call()`/`.apply()` 一节](#bind--call--apply-返回-any--开-strictbindcallapply) 同源（未开 `strictBindCallApply` 导致整条链是 `any`），也可能来自 `catch` 变量、第三方无类型 SDK、或 `JSON.parse()`/`parseYaml()` 结果直接调用。修复思路一致：先把值的类型钉死，而不是逐处加 `eslint-disable`。
+
+```typescript
+// ❌ — origBack 是 any（bind 未开 strictBindCallApply），调用触发 no-unsafe-call
+const origBack = history.back.bind(history);
+origBack();
+
+// ✅ — 见上面 strictBindCallApply 一节，根因修复后 origBack 自动获得正确签名
+```
+
+```bash
+grep -rn "no-unsafe-call" # 来自 eslint 输出，定位实际触发行
+```
 
 ### `.replace()` 回调参数未标注类型
 
