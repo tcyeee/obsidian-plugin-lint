@@ -1,6 +1,6 @@
 ---
 name: obsidian-plugin-lint
-description: Use when asked to lint, check, or review an Obsidian plugin's CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate", "Unexpected browser feature", "Unexpected unknown type selector", "Unsafe assignment to innerHTML", "Sets styles directly instead of using CSS classes", "Unsafe call of an error or any typed value", "This assertion is unnecessary since the receiver accepts the original type of the expression". Also handles the "/obsidian-plugin-publish [version]" release workflow — commit outstanding work, generate version.md from git history since the last release tag, bump manifest.json/package.json, tag, and push to trigger the release pipeline. Triggers on "/obsidian-plugin-publish", "发布插件", "打个 release", "bump version and tag".
+description: Use when asked to lint, check, or review an Obsidian plugin's CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate", "Unexpected browser feature", "Unexpected unknown type selector", "Unsafe assignment to innerHTML", "Sets styles directly instead of using CSS classes", "Unsafe call of an error or any typed value", "Unsafe member access on an error or any typed value", "Unsafe assignment of an error or any typed value", "Passes unsafe values into typed parameters", "This assertion is unnecessary since the receiver accepts the original type of the expression". Also handles the "/obsidian-plugin-publish [version]" release workflow — commit outstanding work, generate version.md from git history since the last release tag, bump manifest.json/package.json, tag, and push to trigger the release pipeline. Triggers on "/obsidian-plugin-publish", "发布插件", "打个 release", "bump version and tag".
 ---
 
 # Obsidian Plugin Lint
@@ -497,6 +497,149 @@ cp /tmp/check-types.mjs . && node check-types.mjs; rm check-types.mjs
 
 若脚本打印出的类型是具体的 interface/union 而不是 `any`，说明该处已经被之前的类型标注修复过，报告是陈旧的——无需改代码，但值得在下一次提交审核前确认问题确实不再出现。
 
+**轻量核实法（不用起 TS API 脚本）**：当报告落在一次简单的方法/属性调用上（`x.includes(...)`、`x.push(...)`、`x.filter(...)` 这类），不必上 TS Compiler API——直接 grep 出该变量/字段的声明处，看它是不是已经有具体类型（`string[]`、`WorkspaceLeaf[]` 等具名类型），而不是 `any` 或未标注：
+
+```bash
+# 例：报告称 src/single-page/LeafCache.ts:52 的 no-unsafe-call
+grep -n "private queue" src/single-page/LeafCache.ts   # -> private queue: WorkspaceLeaf[] = [];
+```
+
+若声明已经是具名类型，`tsc -noEmit` 也不报错，那么该行当前是类型安全的，报告陈旧，跳过。**已核实为陈旧的一批**（2026-07-07 报告，对照当前代码全部已有具名类型，`pnpm build` 的 `tsc -noEmit` 通过）：
+
+| 报告位置 | 变量/字段声明 | 结论 |
+|---------|---------------|------|
+| `src/SettingTab.ts:100` | `listThemes(): string[]`（`main.ts`），`names.includes(...)` | `names` 是 `string[]`，非 `any` |
+| `src/onboarding/OnboardingManager.ts:233` | `onboardingDone: string[]`（`src/core/settings.ts`），`done.includes(label)` | `done` 是 `string[]` |
+| `src/onboarding/OnboardingManager.ts:272` | 同上，`settings.onboardingDone.includes(active.label)` | 同上 |
+| `src/single-page/LeafCache.ts:52` | `private queue: WorkspaceLeaf[]`，`rootLeaves.includes(l)` | `rootLeaves: WorkspaceLeaf[]`，非 `any` |
+
+> 这批例子的共性：都是 `Array.prototype` 方法（`includes`/`push`/`filter`）调用在一个早已声明为具名数组类型的字段/变量上——不存在这几个方法签名退化为 `any` 的原因，说明审核报告采样的是更早（未加类型标注前）的历史 commit。核实后无需改代码，但下次提交前仍建议留意同一位置是否重新出现（例如该字段的声明被误改回宽类型）。
+
+> **⚠️ 2026-07-10 更正——上面这整批"已核实为陈旧"的结论是错的。** Obsidian 官方审核在 2026-07-10 对同一仓库（`obsidian-minimalism-ui`）重新给出了几乎一模一样的报告：`SettingTab.ts:100`、`OnboardingManager.ts:233`、`OnboardingManager.ts:272`、`LeafCache.ts:52` 全部原样复现，外加 `RightSidebarButtonManager.ts` 六处新增命中——逐一核对后，六处新增命中同样全部落在 `.includes(` 调用上（`path.includes(...)` × 4、`this.leafOrder.includes(...)` × 1、以及一处 `const inStack = ... path.includes(...)` 的赋值）。**这批诊断三天后原样复现，且新文件里的命中同样 100% 落在 `.includes()` 上，说明"陈旧报告"的解释是错的——根因当时就存在，只是"轻量核实法"（只查字段声明是否具名数组类型）问的问题不对。** 真正的判断标准不是"这个数组变量有没有具名类型"，而是"`.includes()` 这个*方法本身*在这个项目的有效 `lib` 集合里是否真的被声明"——这是两个独立的问题，具名数组类型（`string[]`、`WorkspaceLeaf[]`）完全不能证明 `.includes` 方法存在，因为该方法来自 `lib.es2016.array.include.d.ts`，是否加载取决于 `tsconfig.json` 的 `"lib"` 字段，与数组元素类型无关。详见下方新增小节，附完整根因定位与验证过程。
+
+### `.includes()` 等 ES2016+ 数组方法在审核环境里被判定为 `error` type——`tsconfig.json` 的 `"lib"` 差一版，靠 `@types/node` 意外补齐
+
+**背景**：本仓库 `tsconfig.json` 长期写着 `"lib": ["ES6", "DOM"]`（`ES6` = `ES2015`）。`Array.prototype.includes()` 是 **ES2016** 才引入的方法（`lib.es2016.array.include.d.ts`），理论上在 `lib: ["ES6", "DOM"]` 下该方法根本不存在，任何 `.includes(...)` 调用都应该报 `TS2550: Property 'includes' does not exist on type 'T[]'`。但本仓库 `pnpm build`（`tsc -noEmit -skipLibCheck`）长期干干净净、从未报过这个错——这就是为什么连续两次审核报告（2026-07-07、2026-07-10）都被误判成"报告陈旧/已经类型安全"：本地验证工具（`tsc -noEmit`）看到的和审核机器人看到的是**两个不同的类型程序**。
+
+**根因**：`package.json` 的 `devDependencies` 里有 `@types/node`，其 `node_modules/@types/node/index.d.ts` 顶部有一行：
+
+```typescript
+/// <reference lib="es2020" />
+```
+
+TypeScript 的行为是：只要程序里**任意一个**被包含的文件（不限于你自己的源码，@types 包的环境声明文件同样算数）带有 `/// <reference lib="..." />`，这个 lib 就会被并入整个程序的全局库集合——**无视 `tsconfig.json` 里 `"lib"` 数组的显式限制**。`@types/node` 默认对所有 `.ts` 文件全局生效（没有 `"types"` 字段收窄的情况下），于是它这一行 reference 把 `lib.es2020.*`（包含 `lib.es2016.array.include.d.ts`）悄悄塞进了程序，本地 `tsc` 看到的 `Array<T>.includes` 因此是合法方法，永远不报错。
+
+**但审核机器人构建的类型检查程序显然没有走到这条隐藏路径**（大概率是 `@typescript-eslint` 对单文件/子集做类型解析时用了不同的 program，或流水线没有安装 `@types/node`），于是在审核环境里 `Array<T>` 只剩 `lib.es2015.core.d.ts` 定义的方法（外加 `obsidian.d.ts` 自己挂的 `contains`/`remove`/`first`/`last`/`shuffle`/`unique`/`findLastIndex`——**注意 `obsidian.d.ts` 全局扩展了 `Array<T>` 但没有加 `includes`**），`.includes` 是不存在的成员，访问它得到 `error` type，于是每一处 `.includes(...)` 调用同时触发 `no-unsafe-call`（调用一个 `error` 类型的"方法"）和（当结果被赋值/传参时）`no-unsafe-assignment`。
+
+**独立复现验证**（不猜测，实测）：
+
+```bash
+# 1. 确认 lib.es2016.array.include.d.ts 只有在 @types/node 存在时才会被隐式拉入
+npx tsc -noEmit -skipLibCheck --listFiles | grep es2016.array.include
+# → 有输出：说明当前确实是靠 @types/node 的隐藏 reference 兜底
+
+# 2. 物理移除 @types/node，模拟审核环境，用旧 lib 配置重测
+mv node_modules/@types/node node_modules/@types/node.disabled
+# （用一份临时 tsconfig，只把 "lib" 改回 ["ES6","DOM"]，其余字段不变）
+npx tsc -p /tmp/tsconfig.old.json -noEmit -skipLibCheck 2>&1 | grep -c "does not exist on type"
+# → 1（复现 TS2550，证实旧配置在没有 @types/node 时真的会炸）
+
+# 3. 同样移除 @types/node，但 "lib" 显式写成 ["ES2016","DOM"]
+npx tsc -p /tmp/tsconfig.fixed.json -noEmit -skipLibCheck 2>&1 | grep -c "does not exist on type"
+# → 0（修复后不再依赖 @types/node 的隐藏兜底）
+
+mv node_modules/@types/node.disabled node_modules/@types/node
+```
+
+**修复**（一行改动，正是本仓库 2026-07-10 采用的方案）：
+
+```jsonc
+// tsconfig.json → compilerOptions
+// ❌ — ES6 = ES2015，Array.prototype.includes 是 ES2016 才有的方法；
+// 本地 tsc 之所以不报错，纯粹是 @types/node 的 /// <reference lib="es2020" /> 意外兜底
+"lib": ["ES6", "DOM"]
+
+// ✅ — 显式声明到实际用到的最低版本；lib.es2016.d.ts 会级联引入 lib.es2015.d.ts，
+// 不丢失原有的 ES2015 特性，且不再依赖任何第三方包的隐藏 reference
+"lib": ["ES2016", "DOM"]
+```
+
+选 `"ES2016"` 而非更高版本的依据：先 grep 一遍项目实际用到的新特性，只升到覆盖这些用法的最低版本，不过度升级：
+
+```bash
+grep -rEn '\.includes\(|\.flat\(|\.flatMap\(|Object\.fromEntries|Promise\.allSettled|\.replaceAll\(|\.matchAll\(' src/ main.ts
+```
+
+若结果只有 `.includes(`，`"ES2016"` 就够；若还用了 `.flat()`/`.flatMap()`（ES2019）或 `Promise.allSettled`（ES2020）等，相应把 `"lib"` 提到对应版本（TS 的 `lib.esXXXX.d.ts` 都是级联引用前序版本，不需要手写多个条目）。
+
+**如何判断"报告是否陈旧"这件事本身要不要重新调查**：如果同一批 `no-unsafe-call`/`no-unsafe-assignment` 诊断在两次相隔数天的审核里**逐字重复**（尤其是新增文件里的新命中，也精确落在同一个方法/模式上），这本身就是判断信号——真正陈旧的报告不会在无关代码新增时，用同一个方法名在新文件里稳定复现。此时应该反过来怀疑"之前判定为陈旧"的验证方法是否问错了问题（例如只检查了变量声明是否具名类型，而没有检查*调用的那个方法*是否真的在项目当前 `lib` 配置下存在），而不是继续假设审核机器人在用旧 commit。
+
+**排查方法**：报告指向 `.includes()`/`.flat()`/`.at()`/`Object.fromEntries()` 等任何 ES2016 及更新版本引入的方法时，先查 `tsconfig.json` 的 `"lib"` 是否覆盖到对应版本；再用 `--listFiles | grep <lib文件名>` 确认这个 lib 文件在当前配置下**是否真的因为 `"lib"` 字段本身**被加载（而非靠某个 `@types/*` 包的隐藏 reference）。判断某个 `@types/*` 包是否存在这类隐藏 reference：
+
+```bash
+grep -rn 'reference lib=' node_modules/@types/*/index.d.ts node_modules/@types/*/*.d.ts 2>/dev/null
+```
+
+**⚠️ 陷阱——`tsc -noEmit` 通过不能排除 `no-unsafe-*`，尤其当报错文案是 "`error` typed value" 而非 "`any` typed value"**：这两种措辞对应完全不同的根因，务必先看清报告原文用的是哪个词：
+
+- **`any` typed value** —— 真正的隐式/显式 `any`（`loadData()`、`.bind()`、`catch` 变量、无类型 SDK 等），本文档其余小节覆盖的都是这类。
+- **`error` typed value** —— TS 类型检查器**根本没能解析出类型**，退化为内部 `error` type。当 `tsconfig.json` 开着 `skipLibCheck: true`（Obsidian 插件模板的默认值）时，这类错误在第三方 `.d.ts` 内部被**静默吞掉**——`tsc -noEmit` 干干净净、零报错，但 `@typescript-eslint`（走真正的 TS 类型检查器 API，不受 `skipLibCheck` 影响，或者说它检查的是使用处而非声明文件本身）能看穿这个 `error` type，逐一标记出所有用到该值的地方。**只跑 `tsc -noEmit` 通过，不足以证明报告陈旧**——必须实际起一次 typescript-eslint 才能确认。
+
+  实测案例（**obsidian-link-trace**，2026-07-07）：`src/render/base-renderer.ts:570-593` 与 `src/publish/exporter.ts:384-394` 报了一整串 `no-unsafe-member-access`/`no-unsafe-assignment`/`no-unsafe-call`/`no-unsafe-argument`，全部原文都是 "**error** typed value"。当时 `package.json` 里 `typescript` 精确锁定在 `4.7.4`（Obsidian 官方脚手架的老默认值），而依赖 `fflate` 的 `.d.ts` 用了 `Uint8Array<ArrayBuffer>` 这种**泛型化的类型化数组**语法（TS 5.7 才支持——TS 4.7 里 `Uint8Array` 根本不是泛型）。`skipLibCheck` 让 `tsc` 对 `fflate/lib/index.d.ts` 自身不做校验，于是这个解析失败被吞掉、`pnpm typecheck` 通过；但每一处 `strToU8()`/`zipSync()` 的返回值在使用处都被判定为 `error` type，凡是赋值/成员访问/当参数传递的地方全部触发 `no-unsafe-*`。
+
+  **真正的修复**：把 `typescript` 从 `4.7.4` 升级到一个既 ≥5.7（`fflate` 泛型语法能正常解析）又不触发更新版本引入的新 breaking change 的版本——本例中 TS 5.9 引入了 `ArrayBufferView<TArrayBuffer>` 更严格的泛型约束，导致 `Uint8Array<ArrayBufferLike>` 不能赋给 `BlobPart`/`ArrayBuffer`（`main.ts`、`src/publish/stores/tencent-store.ts` 各新增一个真错误）；最终选定 **`5.8.3`**（当时 5.8.x 最新稳定版）：`tsc -noEmit` 通过、`vitest` 97 个测试全绿、`base-renderer.ts` 与 `exporter.ts` 上全部 `no-unsafe-*` 清零。不要不加验证就跳到最新版——先跑一遍完整 `tsc -noEmit` 确认没有新增的真错误。
+
+  > **⚠️ 2026-07-09 更正——上面这条 `base-renderer.ts:570-593` 的"已修复"结论是错的，`exporter.ts` 那部分才对。** 审核机器人在 2026-07-09 对 commit `03e1c62`（已确认包含 `typescript@5.8.3`，且 `base-renderer.ts` 自 2026-07-07 起源码逐字节未变）重新给出了**一模一样**的 `base-renderer.ts:570-593` 报告。用同样方法（`typescript-eslint@7` + 候选 `typescript` 版本）复测显示 0 问题——但这只是因为验证用的 `typescript-eslint@7` 太旧，根本没能力复现。换成 `typescript-eslint@8.63.0`（当前 `latest`，其 `package.json` 声明的 peerDependency 是 `"typescript": ">=4.8.4 <6.1.0"`——**latest 版本的 typescript-eslint 本身就不支持 TS ≥6.1**，所以真实机器人不可能跑比 6.1 更新的 TS）配合它能吃的最高版本 `typescript@6.0.3` 重新验证，**完整复现了全部 15 条报告**，且 `tsc --noEmit` 在 6.0.3 下直接给出未被吞掉的真错误：`TS2339: Property 'sort' does not exist on type '"" | {...}'`。根因和 `exporter.ts` 那次完全不同、与 TS 版本本身无关——是源码里 `(viewName && views.find(...)) ?? views[0] ?? {}` 这行的真实类型缺陷（详见下面"`x && y ?? z` 空字符串陷阱"一节），TS 6.x 的控制流分析比 5.8.3 更早捕捉到了它。**教训：只用一个固定的 `typescript-eslint` 大版本本地复测，永远只能验证那个大版本能看到的问题——必须同时覆盖 `typescript-eslint` 自身的大版本，尤其是它当前 `latest` 版本，才能贴近机器人可能正在用的工具链。**
+
+  **如何独立验证**（本仓库没有装 eslint/typescript-eslint，需要临时搭一套，装在项目目录外——例如本会话的 scratchpad——不落进 `package.json`/lockfile）：
+
+  **⚠️ 关键footgun，务必避免**：不要把 `eslint`/`typescript-eslint` 装在一个共享沙盒目录里，然后只靠反复 `ln -sf` 目标仓库的 `node_modules/typescript` 去切换候选版本。Node 的 `require('typescript')` 是从**发起 require 调用的模块自身所在目录**开始向上找 `node_modules`，而 `@typescript-eslint/*`/`ts-api-utils` 这些包物理上装在沙盒目录里，所以它们解析到的永远是**沙盒自己的** `node_modules/typescript`，跟目标仓库里那个符号链接完全无关——改了也白改，会让每一版的复测结果看起来一样（这正是本节 2026-07-09 那次更正之所以发生的直接原因：第一次复测就是这样被误导成"0 问题"的）。同理，若沙盒目录本身又被别的 `npm install typescript@X` 命令原地复用（哪怕只是为了"顺便探一下这个版本装不装得上"），也会静默地把它内部实际生效的 typescript 版本换掉。
+
+  **正确做法：每个候选版本起一个完全独立、自包含的临时项目**，`eslint`/`typescript-eslint`/`typescript` 三者在同一次 `npm install` 里一起装进同一个 `node_modules`，让内部 `require('typescript')` 就地解析到你要测的那个版本；再从仓库目录用**绝对路径**调用这个独立项目里的 `eslint` 可执行文件：
+
+  ```bash
+  SANDBOX=/path/to/scratchpad   # 装在项目外，不要用目标仓库自己的 node_modules
+  for V in <候选版本1> <候选版本2>; do
+    D="$SANDBOX/verify-$V"
+    mkdir -p "$D" && cd "$D" && npm init -y >/dev/null
+    npm install eslint@8 typescript-eslint@7 "typescript@$V"   # 三者一起装，同一 node_modules 内自洽
+  done
+
+  # 对每个候选版本：在仓库目录写一份指向该沙盒 typescript-eslint 的 flat config，
+  # 再用该沙盒的 eslint 可执行文件（绝对路径）跑，全程不碰仓库自己的 node_modules
+  cd <repo>
+  D="$SANDBOX/verify-<候选版本>"
+  cat > eslint.config.mjs <<EOF
+  import tseslint from '$D/node_modules/typescript-eslint/dist/index.js';
+  export default tseslint.config(...tseslint.configs.recommendedTypeChecked, {
+    languageOptions: { parserOptions: { project: '<repo>/tsconfig.json', tsconfigRootDir: '<repo>' } },
+  });
+  EOF
+  node "$D/node_modules/.bin/eslint" <被报告的文件>
+  rm eslint.config.mjs   # 验证完清理，不要提交
+  ```
+
+  **候选版本怎么选，才算"贴近机器人可能在用的版本"**：不要只测报告发生时仓库锁定的那个版本，也要测 `typescript-eslint` 自己当前 `latest` 版本 + 它 peerDependency 允许的最高 `typescript`（`npm view typescript-eslint@latest peerDependencies` 能查到范围，比如 `>=4.8.4 <6.1.0`，那就测 `<6.1.0` 里能装到的最新稳定版）——这是唯一能验证"最新维护的机器人工具链"的方式，因为 `typescript-eslint` 的类型消解行为在大版本之间可能有实质差异（详见上面 2026-07-09 更正）。同时用同一版本跑一次 `tsc --noEmit`（不经 `skipLibCheck` 吞掉的那种，即直接跑，不加 `-p` 覆盖），如果冒出没被 `no-unsafe-*` 提示说明白的具体 `TSxxxx` 错误，那才是能一眼定位根因的地方，比对着 eslint 的"error typed value"猜要快得多。
+
+### `x && y.find(...) ?? fallback` 空字符串陷阱 — 看似 `error typed value`，实为真实类型缺陷
+
+**这条容易被误判为"又是某个第三方库 `.d.ts` 解析失败"（参考上面 `error` vs `any` 那节），但根因完全不同、和 TS 版本本身无关，是源码里一个真实的类型窟窿。** `??` 只在左侧是 `null`/`undefined` 时才取右侧兜底值，对其他假值（空字符串 `""`、`0`、`false`）一概放行。当左侧表达式是 `x && expr`（而不是 `x !== undefined ? expr : undefined`）、且 `x` 的类型包含 `string`/`number` 等有假值的原始类型时，`x` 为假值那一分支会把 `x` 本身（而非 `undefined`）短路返回——这个假值会原样穿过后面的 `?? fallback`，变成整个表达式类型里一个多余的字面量分支：
+
+```typescript
+// ❌ — obsidian-link-trace src/render/base-renderer.ts:553（2026-07-09 实测）
+// viewName?: string；当 viewName === "" 时，`viewName && views.find(...)` 短路返回 ""，
+// 而 "" 不是 null/undefined，不会被 ?? 拦下，于是 view 的类型里混进了字面量 ""
+const view = (viewName && views.find(v => v.name === viewName)) ?? views[0] ?? {};
+// 之后所有 view.sort / view.limit / view.filters 都要在 "" 这个分支上找属性，自然找不到
+
+// ✅ — 用显式的 undefined 判断代替 JS 假值短路，不给假值字面量留混入类型的空间
+const view = (viewName !== undefined ? views.find(v => v.name === viewName) : undefined) ?? views[0] ?? {};
+```
+
+**为什么本地 `tsc -noEmit` 常年干净、只有升级到更新的 TypeScript（或换用更新的 `typescript-eslint`）才会暴露**：这是 TS 编译器控制流分析精度的问题，不是某个开关；较新版本对 `&&` 短路结果的字面量类型跟踪更精确，会把这类假值分支纳入推断，从而在使用处报出实打实的 `TS2339: Property 'xxx' does not exist on type '"" | {...}'`；较旧版本可能把整个 `&&` 表达式粗粒度地推宽，不出现这个字面量分支，因而查不出来。`@typescript-eslint`（在配了 `skipLibCheck` 等吞掉第三方 `.d.ts` 解析失败的情况下）会把这类真错误也一并归入同一批 "error typed value" 的 `no-unsafe-*` 报告里，和"某个依赖的 `.d.ts` 在老 TS 下解析失败"这种纯工具链问题**长得一模一样**，必须靠 `tsc --noEmit`（不加 `skipLibCheck` 遮蔽，或直接换更新的 TS 版本跑）看到具体 `TSxxxx` 错误信息，才能分清是源码真 bug 还是纯粹的版本兼容问题——处理方式截然不同：真 bug 要改源码逻辑，版本兼容问题可能只需换个 TS 版本或忽略。
+
+**排查方法**：`grep -rn '&&.*?? \|&&.*??' src/*.ts` 找出 `x && y ?? z` 形状的表达式，重点看 `x` 的类型是否包含 `string`/`number`（有假值的原始类型）——`boolean`/对象/`Type | undefined` 这类没有"非 null/undefined 假值"的类型不受影响，无需改。
+
 **非空断言 `x!` 的同名陷阱（lint 与本地 tsc 不同步）**：本仓库 `strictNullChecks: true`，本地 `tsc` 下 `WorkspaceLeaf | null` 的 `x!` 是必要的；但 Obsidian 提交机器人的 type-check **不开 strictNullChecks**，`null` 不被跟踪，`x` 已是非空类型，于是 `x!` 被判为多余而报同一条 `no-unnecessary-type-assertion`。
 
 陷阱在于：把布尔结果存进**单独的变量**（如 `canReuse`）后，TS 无法借它收窄原变量，所以才被迫写 `x!`。**正确修复不是删 `!`（删了本地严格 tsc 会报 null）**，而是在使用处把判空重新并入条件，让控制流自行收窄——既满足机器人（无断言），又满足本地严格 tsc（已收窄）：
@@ -821,6 +964,21 @@ overrides:
 | `description` | 以插件名开头（如 `"Image Cluster helps you..."`) | 直接描述功能，去掉开头的插件名 |
 | `minAppVersion` | 低于代码中实际使用的 API 所需版本 | 升高 `minAppVersion` 至 API 要求的最低版本 |
 
+**Release tag 严禁加 `v` 前缀**：Obsidian 官方明确要求 GitHub Release 的 tag 必须与
+`manifest.json` 的 `version` 字段逐字符相等（`1.0.0`，不是 `v1.0.0`）——这是 Obsidian 侧
+"No release matches your manifest version" 报错信息里明确写出的两个可能原因之一（另一个是本文档
+上面「Release 不能停在 draft」一节的 draft 问题；报错文案会同时提示这两种可能，出现该报错时两个都要
+排查，不要只查一个就下结论）。`/obsidian-plugin-publish` 的 Step 3/4 创建新 tag 时必须始终用裸版本号
+（`git tag -a "$NEW_VERSION"`，不要拼接 `v` 前缀）；上面 Step 2 提到的 `v<version>` fallback
+**只用于向后查找某个仓库历史遗留的旧 tag 做 changelog diff**，绝不能反过来用它作为新 tag 的命名依据。
+
+```bash
+# 核实：当前 manifest.json 版本对应的 tag/release 是否真的裸版本号、且已发布
+V=$(node -pe "require('./manifest.json').version")
+git tag -l "$V" "v$V"                                    # 应只有裸版本号那一行有输出
+gh release view "$V" --json tagName,isDraft --jq '.'     # tagName 应等于 $V，isDraft 应为 false
+```
+
 **minAppVersion 兼容性检查：** 代码中用到的 API 必须在 `minAppVersion` 对应的版本中已存在。常见不兼容示例：
 
 | API | 最低要求版本 |
@@ -899,10 +1057,56 @@ jobs:
 
 缺少任一项均视为违规，需补全。
 
+### ⚠️ Release 不能停在 draft —— Obsidian 要求有一个已发布的 release 匹配 manifest.json 版本
+
+**真实故障案例**（obsidian-link-trace，2026-07-09）：`gh release create` 带了 `--draft`，且
+`/obsidian-plugin-publish` 流程在推送 tag 后就停止，从不检查/发布这个 release。`manifest.json`
+在 `main` 分支上已经写着新版本号并被推送，但对应 tag 的 GitHub Release 一直停在 Draft 状态，
+直到有人手动点击 "Publish release"。这个手动步骤很容易被忘记——一旦忘记，Obsidian 的插件安装/
+更新检查会报错：
+
+```
+No release matches your manifest version
+Your manifest.json points at a version that doesn't have a matching GitHub release.
+...
+Publish a release on GitHub
+```
+
+原因：Obsidian 通过 GitHub Releases API 按 tag 精确匹配下载资产，**draft release 对该 API 不可见**
+（等同于不存在），而仓库里 `manifest.json` 的版本号早已公开可见——于是出现"manifest 说是 X.Y.Z，
+但公网找不到 X.Y.Z 的 release"这个不一致窗口，且如果没人记得手动发布，这个窗口永远不会关闭。
+
+**根治方法**：`gh release create` **不要带 `--draft`**，让 CI 构建成功即为发布成功，不存在需要
+人记住的手动步骤：
+
+```bash
+# ❌ — 需要人工事后点 Publish，容易忘记，忘记期间 manifest.json 版本对不上任何 release
+gh release create "$tag" --title="$tag" --draft main.js manifest.json styles.css
+
+# ✅ — CI 绿灯即代表已发布，manifest.json 推送的那一刻就有对应 release
+gh release create "$tag" --title="$tag" main.js manifest.json styles.css
+```
+
+若某个项目确实需要发布前人工审核（不想让 CI 直接公开），**不要**简单加 `--draft` 了事——那就是
+这个 bug 的根源。改为在 CI 里保留 draft，但在 `/obsidian-plugin-publish` 流程的最后新增一步：
+等待该次 push 触发的 workflow run 完成，然后 `gh release edit "$tag" --draft=false` 自动发布，
+把"记得手动发布"这件事从人的记忆里挪回自动化流程。
+
+**检查现有仓库是否已经踩坑**：
+
+```bash
+# 1. 工作流是否硬编码 --draft
+grep -n '\-\-draft' .github/workflows/release.yml
+
+# 2. manifest.json 当前版本是否真的有一个已发布（非 draft）的 release
+PREV=$(node -pe "require('./manifest.json').version")
+gh release view "$PREV" --json isDraft --jq .isDraft   # true → 立刻发布：gh release edit "$PREV" --draft=false
+```
+
 ### Populating release notes from the tag message
 
 不同项目的发布机制不统一——有的直接调 `gh release create`，有的用第三方 Action（如
-`softprops/action-gh-release`）。为了让"draft release 自动带上本次更新内容"这件事能跨项目复用，
+`softprops/action-gh-release`）。为了让"release 自动带上本次更新内容"这件事能跨项目复用，
 约定把决策点放在本地打 tag 那一步（见上面 Step 2/3）：notes 的实际内容在本地生成，写进
 **annotated tag 的 message**；CI 端只需要把这条 tag message 原样读出来，完全不用关心它最初来自哪个
 changelog 文件、标题格式长什么样。
@@ -917,23 +1121,49 @@ grep -rl "gh release create\|action-gh-release" .github/workflows/*.yml
 `--notes-file`；如果 tag 没有内容（比如遗留的 lightweight tag），fallback 到 `--generate-notes`
 （GitHub 按 commit/PR 自动生成），保证不会因为读不到 notes 而报错或产出空 body：
 
+⚠️ **`actions/checkout` 会吞掉 annotated tag 的 message**：默认配置下它只按 `GITHUB_SHA`（tag
+指向的 commit，而非 tag 对象本身的 SHA）做浅拉取，本地生成的 `refs/tags/<tag>` 只是指向该 commit
+的轻量引用，annotation 内容随之丢失。此时 `git tag -l --format='%(contents)'` 不会报错、也不会为
+空——它会**悄悄**返回 commit 的提交信息（因为轻量 tag 的 `%(contents)` 就是其指向 commit 的
+message），于是脚本走进第一个分支，release body 变成一行 `chore(release): bump version to
+x.y.z`，而不是真正的 changelog。必须在读取前显式按引用名重新拉取一次 tag 对象，覆盖本地那个轻量引用：
+
 ```yaml
 - name: Create release
   env:
     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   run: |
     tag="${GITHUB_REF#refs/tags/}"
+
+    # 强制按引用名重新拉取真正的 tag 对象（而非 actions/checkout 留下的、
+    # 指向 commit 的轻量引用），否则下面的 %(contents) 读到的是 commit message。
+    git fetch origin "refs/tags/$tag:refs/tags/$tag" --force
+
     notes="$(git tag -l --format='%(contents)' "$tag")"
 
     if [ -n "$notes" ]; then
       echo "$notes" > /tmp/release-notes.md
-      gh release create "$tag" --title="$tag" --draft --notes-file /tmp/release-notes.md <assets...>
+      gh release create "$tag" --title="$tag" --notes-file /tmp/release-notes.md <assets...>
     else
-      gh release create "$tag" --title="$tag" --draft --generate-notes <assets...>
+      gh release create "$tag" --title="$tag" --generate-notes <assets...>
     fi
 ```
 
-（`<assets...>` 替换为该项目实际发布的文件列表，例如 `main.js manifest.json styles.css`。）
+（`<assets...>` 替换为该项目实际发布的文件列表，例如 `main.js manifest.json styles.css`。不要加
+`--draft`——见上面「Release 不能停在 draft」一节：draft release 对 Obsidian 的下载/更新检查不可见，
+如果没人记得手动发布，会让 `manifest.json` 的公开版本号长期对应不上任何可下载的 release。）
+
+**验证方法**：release 发布后用 `gh release view <tag> --json body` 核对 body 是否等于本地
+`git tag -l --format='%(contents)' <tag>` 的输出，而不是仅仅"CI 跑绿了"就当作正确——这个 bug
+不会导致 workflow 失败，只会静默产出错误内容。同时用 `gh release view <tag> --json isDraft --jq
+.isDraft` 确认结果是 `false`。
+
+⚠️ **若项目就是要保留 draft（人工审核后再发布）**：改 notes 时不要用 `gh release edit
+--notes-file` 而不带 `--draft`——`gh release edit` 对未显式传入的 `--draft` 会按 `false` 处理，
+而不是"保持原值"，只改 notes 就会把 draft release 意外发布成正式 release（`isDraft` 从 `true`
+变 `false`，且发布后再改回 draft 会导致 release 的 URL 变成 GitHub 分配的 `untagged-<hash>`
+占位符，虽然 `tag_name` 字段和已上传的 assets 不受影响，仍指向原 tag）。修正 body 时必须显式
+带上当前的 draft 状态：`gh release edit <tag> --notes-file <file> --draft=true`。
 
 **若用 `softprops/action-gh-release`**——该 Action 在没有显式设置 `body` / `body_path` /
 `generate_release_notes: true` 时，通常会默认用 annotated tag 的 message 作为 release body；只需确认
