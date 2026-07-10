@@ -470,6 +470,22 @@ const zip = zipSync(files, { level: 6 });
 
 不确定库的真实返回类型时，别猜——直接查 `node_modules/<pkg>/**/*.d.ts` 里的函数签名，或用 TS 官方 API 现场核实（见下方"核实陈旧报告"）。
 
+**⚠️ 第三类陷阱——`as` 断言本身就是让类型"看起来不需要断言"的原因，删掉后类型会真的变宽（实测案例，obsidian-image-cluster，2026-07-10）**：`Element.prototype.closest<E extends Element = Element>(selectors: string): E | null` 是泛型方法，`E` 默认收窄为 `Element`。当写成 `el.closest(".cm-editor") as HTMLElement | null` 时，TypeScript 会把 `as` 右边的类型当作**上下文类型**反向喂给 `closest<E>` 的泛型推断（这是 TS 对括在 `as` 里的表达式做上下文类型标注的通用行为，不是 `closest` 特有的），于是 `E` 被推成 `HTMLElement`——断言写出来之后，表达式自己的类型就已经等于断言目标，`no-unnecessary-type-assertion` 因此判定"断言不改变类型"而报多余。**但这是循环论证式的假象**：断言之所以"不改变类型"，恰恰是因为断言本身才是让 `E` 被推成 `HTMLElement` 的原因——按标准做法直接删掉 `as`，`E` 会失去这个上下文提示，退回默认值 `Element`，类型真的变宽了：
+
+```typescript
+// ❌ — 机器人报 no-unnecessary-type-assertion，但直接删掉 as 是错的
+const editorRoot = el.closest(".cm-editor") as HTMLElement | null;
+// 若真的删掉 as：editorRoot 的类型退化为 Element | null（closest<E> 失去上下文推断依据）
+// 而下面这行要求形参是 HTMLElement，Element 不能赋值给它，产生真实的 TS2345 错误
+EditorView.findFromDOM(editorRoot);   // declare findFromDOM(dom: HTMLElement): EditorView | null
+
+// ✅ — 用显式类型实参替代 as，直接让 closest 在类型层面就返回 HTMLElement | null，
+// 断言的"上下文类型反哺泛型推断"这条隐藏路径完全不再涉及，机器人和本地 tsc 都满意
+const editorRoot = el.closest<HTMLElement>(".cm-editor");
+```
+
+**判断信号**：报告位置是一个「泛型方法调用外面包一层 `as`」（不是简单变量/字面量），且该泛型方法有 `<T extends Base = Base>` 形式的默认类型参数——直接删断言前，先手写一个不带 `as`、不带任何外部上下文类型的最小复现文件，用上面「核实报告是否陈旧」一节的 TS Compiler API 脚本实际打印删除断言后的类型，确认是否真的收窄到位；若变宽了，改用 `方法名<T>(...)` 显式类型实参，而不是删掉断言。`Element.closest`/`querySelector`/`querySelectorAll` 等 DOM 方法均属此类（`querySelector<E extends Element = Element>(selectors: string): E | null`），符合就用同一个修法。
+
 ### 核实 no-unsafe-* / no-unnecessary-type-assertion 报告是否已过时
 
 审核报告里的行号对应的是**提交时的某个历史 commit**，如果这之后已经给相关接口补上了显式类型（例如给 `parseYaml()` 的结果定义了具体 interface 并 `as` 过一次），报告里那几行在当前代码里可能已经不再是 `any` 了。逐条盲目"修复"已经安全的代码没有意义，先核实：
@@ -620,6 +636,23 @@ grep -rn 'reference lib=' node_modules/@types/*/index.d.ts node_modules/@types/*
   ```
 
   **候选版本怎么选，才算"贴近机器人可能在用的版本"**：不要只测报告发生时仓库锁定的那个版本，也要测 `typescript-eslint` 自己当前 `latest` 版本 + 它 peerDependency 允许的最高 `typescript`（`npm view typescript-eslint@latest peerDependencies` 能查到范围，比如 `>=4.8.4 <6.1.0`，那就测 `<6.1.0` 里能装到的最新稳定版）——这是唯一能验证"最新维护的机器人工具链"的方式，因为 `typescript-eslint` 的类型消解行为在大版本之间可能有实质差异（详见上面 2026-07-09 更正）。同时用同一版本跑一次 `tsc --noEmit`（不经 `skipLibCheck` 吞掉的那种，即直接跑，不加 `-p` 覆盖），如果冒出没被 `no-unsafe-*` 提示说明白的具体 `TSxxxx` 错误，那才是能一眼定位根因的地方，比对着 eslint 的"error typed value"猜要快得多。
+
+**⚠️ 这个根因不止 `.includes()` 一个方法——任何比 `tsconfig.json` 声明的 `lib` 更新的内置方法都会中招**（实测案例，**obsidian-image-cluster**，2026-07-10）：该仓库 `tsconfig.json` 原先写着 `"lib": ["DOM", "ES5", "ES6", "ES7"]`（ES7 = ES2016，只到 `Array.prototype.includes`）。审核报告命中了两处完全不同的方法：
+
+- `src/core/dom.ts:6-7` —— `Object.entries(props).forEach(...)`。`Object.entries` 是 **ES2017**（`lib.es2017.object.d.ts`），比 `ES7` 还高一版，于是 `Object.entries(...)` 本身就是 `error` type：对它调用 `.forEach` 触发 `no-unsafe-call`，解构出的 `[key, value]` 触发 `no-unsafe-member-access`，传给 `el.style.setProperty(key, value)`（形参是具名 `string`）触发 `no-unsafe-argument`。
+- `src/render/layout.ts:182-186` —— `visibleRows.flat()`。`.flat()` 是 **ES2019**（`lib.es2019.array.d.ts`），同样只在使用处产生一整串 `no-unsafe-call`/`no-unsafe-member-access`/`no-unsafe-assignment`（`flattenedVisible` 被后续代码 `.slice()`、下标访问、塞进 `Set` 全部连带報错）。
+
+两处根因与 `.includes()` 完全相同（`@types/node` 的 `/// <reference lib="es2020" />` 在本地 `tsc` 里悄悄把 `lib.es2017.*`/`lib.es2019.*` 一并拉了进来，`pnpm build` 因此常年干净），只是命中的具体方法不同——**这证明判断标准要看的是"项目实际用到的每一个内置 API 各自需要哪个 lib 版本"，而不是死记"`.includes()` 需要 ES2016"这一条**。修复同样是把 `tsconfig.json` 的 `"lib"` 提到覆盖所有实际用法的最低版本（这里 `Object.entries` 需要 ES2017、`.flat()` 需要 ES2019，两者取高——`"lib": ["DOM", "ES2019"]`，级联包含 ES2015~ES2019，不必逐条列出 ES5/ES6/ES7），并用上面同款「物理移除 `@types/node`、重跑 `tsc -noEmit`」的方法验证修复后不再依赖隐藏兜底：
+
+```bash
+# 排查：不要只 grep .includes(，把所有 ES2016 之后新增的常用内置方法一并扫一遍
+grep -rEn '\.includes\(|\.flat\(|\.flatMap\(|Object\.(entries|values|fromEntries|getOwnPropertyDescriptors)|Promise\.allSettled|\.padStart\(|\.padEnd\(|\.trimStart\(|\.trimEnd\(|\.matchAll\(|\.replaceAll\(' src/ main.ts
+
+# 验证：物理移除 @types/node，确认新 lib 配置本身（而非隐藏 reference）就能让 tsc 通过
+mv node_modules/@types/node node_modules/@types/node.disabled
+npx tsc -noEmit -skipLibCheck
+mv node_modules/@types/node.disabled node_modules/@types/node
+```
 
 ### `x && y.find(...) ?? fallback` 空字符串陷阱 — 看似 `error typed value`，实为真实类型缺陷
 
