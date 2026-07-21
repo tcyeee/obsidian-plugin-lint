@@ -1,6 +1,6 @@
 ---
 name: obsidian-plugin-lint
-description: Use when asked to lint, check, or review an Obsidian plugin's CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate", "Unexpected browser feature", "Unexpected unknown type selector", "Unsafe assignment to innerHTML", "Sets styles directly instead of using CSS classes", "Unsafe call of an error or any typed value", "Unsafe member access on an error or any typed value", "Unsafe assignment of an error or any typed value", "Passes unsafe values into typed parameters", "This assertion is unnecessary since the receiver accepts the original type of the expression". Also handles the "/obsidian-plugin-publish [version]" release workflow — commit outstanding work, generate version.md from git history since the last release tag, bump manifest.json/package.json, tag, and push to trigger the release pipeline. Triggers on "/obsidian-plugin-publish", "发布插件", "打个 release", "bump version and tag".
+description: Use when asked to lint, check, or review an Obsidian plugin's CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate", "Unexpected browser feature", "Unexpected unknown type selector", "Unsafe assignment to innerHTML", "Sets styles directly instead of using CSS classes", "Unsafe call of an error or any typed value", "Unsafe member access on an error or any typed value", "Unsafe assignment of an error or any typed value", "Passes unsafe values into typed parameters", "This assertion is unnecessary since the receiver accepts the original type of the expression", "This assertion is unnecessary since it does not change the type of the expression", "overrides all other types in this union type", "display is deprecated", "Use getSettingDefinitions instead". Also handles the "/obsidian-plugin-publish [version]" release workflow — commit outstanding work, generate version.md from git history since the last release tag, bump manifest.json/package.json, tag, and push to trigger the release pipeline. Triggers on "/obsidian-plugin-publish", "发布插件", "打个 release", "bump version and tag".
 ---
 
 # Obsidian Plugin Lint
@@ -261,6 +261,22 @@ Obsidian 插件审核机器人会扫描以下模式：
 
 `createDiv` / `createSpan` / `createEl` 均为 Obsidian 全局函数，无需 import。`DomElementInfo` 支持 `{ cls, text, type, attr }` 等属性，可在创建时一步设置，省去单独赋值。
 
+**目标父节点不是 workspace 里的某个 `containerEl`，而是 `document.head`/`document.body` 本身时，用父节点自己的 `.createEl()` 方法，而不是裸的全局 `createEl()`。** 全局 `createDiv()`/`createEl()` 创建的是一个*游离*节点，仍需手动 `appendChild` 才能挂上树；Obsidian 把同名方法也挂在了 `HTMLElement.prototype` 上（包括 `document.head`/`document.body` 这两个原生元素），调用 `parentEl.createEl(tag, info)` 会创建并**自动 append** 为 `parentEl` 的子节点，一步到位。往 `<head>` 里插入运行时样式表（主题 CSS、动态注入的 `<style>`）是这个模式最常见的场景：
+
+```typescript
+// ❌ — src/core/ThemeLoader.ts:43（实测，obsidian-minimalism-ui，2026-07-21）
+const style = activeDocument.createElement('style');
+style.setAttribute('data-my-theme', name);
+style.textContent = css;
+activeDocument.head.appendChild(style);
+
+// ✅ — activeDocument.head 本身有 createEl，一次调用完成"创建+设属性+设内容+挂载"
+activeDocument.head.createEl('style', {
+    attr: { 'data-my-theme': name },
+    text: css,
+});
+```
+
 ```bash
 grep -n "document\.createElement" src/*.ts
 ```
@@ -346,6 +362,28 @@ if (node.instanceOf(Element)) { /* ... */ }
 ```
 
 ## TypeScript 类型安全
+
+### `unknown` 与其他类型组成联合类型 → `no-redundant-type-constituents`
+
+机器人原文：`'unknown' overrides all other types in this union type.` `unknown` 是所有类型的顶类型，`X | unknown` 在结构上恒等于 `unknown`——联合里的其他成员（哪怕是 `null`、某个具名接口）都被 `unknown` 吞掉，写出来没有任何额外的类型信息，纯属误导读者。常见于给一个"可能拿不到具体类型、干脆返回 unknown"的私有辅助方法顺手加了 `| null`：
+
+```typescript
+// ❌ — src/right-sidebar/RightSidebarButtonManager.ts:597（实测，obsidian-minimalism-ui，2026-07-12）
+// unknown | null 在类型层面等价于 unknown，| null 是死代码，读者会误以为返回值区分"有值/无值"
+private findExistingRightSidebarParent(): unknown | null {
+    const { rightSplit } = this.app.workspace;
+    if (!rightSplit) return null;
+    // ...
+    return found ? (found as unknown as { parent: unknown }).parent : null;
+}
+
+// ✅ — 直接删掉 `| null`，返回类型如实反映"unknown 本身已经涵盖 null"
+private findExistingRightSidebarParent(): unknown {
+    // ...
+}
+```
+
+> 判断信号：报告的联合类型字面量里出现 `unknown`（不是 `any`——`any` 不会吞并 `unknown`/`never` 之外的成员，只有 `unknown` 才有这种"覆盖一切"的效果），修法永远是删掉其余成员，只保留 `unknown`。函数体内 `return null`/`return someValue` 不需要跟着改——`null`、具体对象都能隐式赋值给 `unknown`，删掉联合里多余的成员只影响*声明的返回类型*，不影响函数体的合法性。
 
 ### 避免 `as TFile` 强制转换 → 用 `instanceof TFile` 收窄
 
@@ -707,6 +745,33 @@ private get leftSplit(): WorkspaceSidedock | null {
 
 > 判断信号：断言链路是 `as unknown as X`，且断言结果被直接 `return`/传参/赋值给一个类型早已声明为兼容 `X`（或更宽）的位置——先看接收方的类型声明，而不是表达式自身的控制流收窄。
 
+**第四种变体——通过一个别名布尔变量间接收窄（TS 4.4+ aliased conditions）**：TypeScript 4.4 起支持"别名条件收窄"——`const disabled = !leaf` 这种把某个变量的判空结果存进一个新的 `const` 布尔变量后，后续 `if (disabled) return;` 依然能让 TS 把 `leaf` 收窄为非空，即使收窄发生在一个稍后才调用的闭包内部（只要 `leaf` 本身从未被重新赋值）。这与上面"存进单独变量后 TS 无法收窄，只能写 `x!`"的陷阱刚好相反——`no-unnecessary-type-assertion` 只是运气好命中了 TS 能处理的这一种别名形式，遇到报告先验证是否属于这一种，而不是默认套用"重并判空"的修法：
+
+```typescript
+// ❌ — src/layout/StatusBarMenuManager.ts:258-259（实测，obsidian-minimalism-ui，2026-07-12）
+// disabled 是 !leaf 的别名，renderModeSegment 提前 `if (disabled) return;`，
+// TS 4.4+ 借助别名条件收窄，从这一行往后（包括下面 for 循环里定义、稍后才触发的
+// click/keydown 闭包）leaf 的类型已经是 WorkspaceLeaf，非空断言是多余的
+private renderModeSegment(container: HTMLElement, leaf: WorkspaceLeaf | null): void {
+    const disabled = !leaf;
+    // ...
+    if (disabled) return;
+    for (const { btn, opt } of buttons) {
+        const activate = () => {
+            const viewState = leaf!.getViewState();
+            void leaf!.setViewState({ ...viewState, state: { ...viewState.state, mode: opt.viewMode, source: opt.source } }).then(updateActiveState);
+        };
+        // ...
+    }
+}
+
+// ✅ — 直接删掉两处 `!`，TS 借助别名收窄已经知道 leaf 非空
+const viewState = leaf.getViewState();
+void leaf.setViewState({ ...viewState, state: { ...viewState.state, mode: opt.viewMode, source: opt.source } }).then(updateActiveState);
+```
+
+> 判断信号：断言对象是函数参数（不是通过 `.bind`/闭包捕获的外部变量），且函数体内在断言之前有形如 `if (aliasVar) return;` / `if (!aliasVar) return;` 的提前返回，其中 `aliasVar` 是一个 `const` 且其初始化表达式直接引用了该参数（`!leaf`、`leaf == null` 等）——本地 `tsc -noEmit` 通常也会同步报出这条（因为这是 TS 自身的收窄能力，不像上一种依赖机器人 strictNullChecks 配置差异），可以先跑一次 `tsc -noEmit` 验证是否双边都报错，双边一致时直接删断言即可，不需要额外的判空收窄改写。
+
 ### `no-unsafe-call` — 调用一个 `any`/`error` 类型的值
 
 机器人原文：`Unsafe call of an 'error' or 'any' typed value.` 触发于把一个未标注类型（因而退化为 `any`）的值当函数调用，常见来源与 [`.bind()`/`.call()`/`.apply()` 一节](#bind--call--apply-返回-any--开-strictbindcallapply) 同源（未开 `strictBindCallApply` 导致整条链是 `any`），也可能来自 `catch` 变量、第三方无类型 SDK、或 `JSON.parse()`/`parseYaml()` 结果直接调用。修复思路一致：先把值的类型钉死，而不是逐处加 `eslint-disable`。
@@ -939,18 +1004,111 @@ declare module "ali-oss" {
 } catch (err: unknown) { console.warn(err); }
 ```
 
-### 废弃 API → eslint-disable 或迁移
+### 废弃 API：`PluginSettingTab.display()` → 迁移到 `getSettingDefinitions()`
 
-Obsidian 1.13.0 将 `PluginSettingTab.display()` 标为 `@deprecated`，推荐改用 `getSettingDefinitions()`。迁移需要完整重写 Settings Tab（声明式 API）。在迁移前，用带说明的 `eslint-disable-next-line` 压制警告：
+机器人原文：`` `display` is deprecated. Since 1.13.0. Use {@link getSettingDefinitions} instead. `` Obsidian 1.13.0 把 Settings Tab 的渲染方式从"整体重写 `display()`"改成声明式的 `getSettingDefinitions()`：只要这个方法返回非空数组，框架就完全接管渲染，`display()` 根本不会被调用（不是"两者都执行、`display()` 优先级更低"）。**先确认这条报告不是陈旧的**——若仓库的 `node_modules/obsidian/obsidian.d.ts` 里 `getSettingDefinitions` 还不存在（`grep -n getSettingDefinitions node_modules/obsidian/obsidian.d.ts`），说明本地 `obsidian` 类型包版本早于 1.13.0，先升级 `obsidian` devDependency 再动手。
+
+**不要用 `eslint-disable` 压制了事——完整迁移的风险比看起来小，因为可以把原有的命令式 `Setting` 构建代码几乎原样保留**，只是换了一层入口。关键决策：
+
+**用 `render`-type definition 包住原有代码，不要用 `control`+`key` 的声明式绑定。** `SettingDefinition` 联合里有两种形态：`control`-type（`{ control: { type: 'toggle', key: 'foo', ... } }`，框架通过 `getControlValue(key)`/`setControlValue(key, value)` 读写，需要新增一层按 key 分发的存取逻辑）和 `render`-type（`{ render: (setting: Setting) => {...} }`，框架建好一个空的 `Setting` 行传进来，剩下的完全由你摆布）。已有的 `new Setting(el).setName(...).addToggle(...).onChange(...)` 代码几乎可以逐字保留在 `render` 回调里，只是把 `new Setting(container)` 换成回调参数 `setting`——风险和改动量都远小于为每个字段重新设计 `key`/`getControlValue`/`setControlValue`：
 
 ```typescript
-// ❌
-this.display();
+// 之前（imperative display()）
+new Setting(sectionEl)
+    .setName(t('hideTabBar'))
+    .addToggle(toggle => toggle
+        .setValue(this.plugin.settings.hideTabBar)
+        .onChange(async v => {
+            this.plugin.settings.hideTabBar = v;
+            await this.plugin.saveSettings();
+        }));
 
-// ✅ — suppress until the tab is migrated to getSettingDefinitions()
-// eslint-disable-next-line @typescript-eslint/no-deprecated -- PluginSettingTab.display() deprecated in 1.13.0; migrate to getSettingDefinitions() when refactoring settings
-this.display();
+// 之后（getSettingDefinitions，render-type，逻辑逐字保留）
+{
+    name: t('hideTabBar'),
+    render: (setting) => {
+        setting.addToggle(toggle => toggle
+            .setValue(this.plugin.settings.hideTabBar)
+            .onChange(async v => {
+                this.plugin.settings.hideTabBar = v;
+                await this.plugin.saveSettings();
+            }));
+    },
+},
 ```
+
+**`render` 回调的返回类型是 `void | (() => void)`，不是 `Setting`**——`Setting.addToggle`/`addDropdown`/`addText` 都返回 `this`，箭头函数写成表达式体（`render: (setting) => setting.addToggle(...)`）会把这个 `Setting` 当成返回值，触发 `Type '(setting: Setting) => Setting' is not assignable to type 'undefined'`。必须用花括号语句体丢弃返回值：
+
+```typescript
+// ❌ — 表达式体隐式返回 Setting
+render: (setting) => setting.addToggle(toggle => toggle.setValue(x).onChange(fn)),
+
+// ✅ — 语句体返回 void
+render: (setting) => { setting.addToggle(toggle => toggle.setValue(x).onChange(fn)); },
+```
+
+**分组（`SettingDefinitionGroup`）的 `items` 字段类型是 `SettingGroupItem[]`（`SettingDefinition | SettingDefinitionPage`），不是顶层 `getSettingDefinitions()` 返回的 `SettingDefinitionItem[]`（多了 `Group`/`List`）。** 把一个类型为 `SettingDefinitionItem[]` 的数组传给某个 group 的 `items`，TS 会报出一个和实际错误位置错位的confusing 提示（例如 `Type '"group"' is not assignable to type '"page"'`，看起来在怪你外层的 `type: 'group'` 字面量，实际是 `items` 类型不兼容导致 TS 退化去匹配 `SettingDefinitionPage`）。收到这类"类型字面量对不上"的报错时，先检查传入 `items` 的数组元素类型是不是被错误地声明为顶层联合，而不是死抠报错指向的那一行：
+
+```typescript
+// ❌ — items 参数类型太宽，包含 group/list，group.items 期望更窄的 SettingGroupItem[]
+private section(key: string, title: string, items: SettingDefinitionItem[]): SettingDefinitionItem[] {
+    return [
+        { name: title, render: renderHeading },
+        { type: 'group', visible: () => !collapsed, items },   // TS2322，报错指向别处
+    ];
+}
+
+// ✅
+private section(key: string, title: string, items: SettingGroupItem[]): SettingDefinitionItem[] { ... }
+```
+
+**没有原生的"可折叠分组标题"控件——自定义标题行 + 分组的 `visible` 谓词组合实现，同时可以删掉旧的 CSS 相邻兄弟选择器 hack。** `SettingDefinitionGroup.heading` 只是静态文本，没有点击折叠的能力。做法：分组标题做成一个独立的、位于 group **外面**的 `render`-type item（在其 `render` 回调里 `setting.settingEl.empty()` 后完全自定义 DOM，复刻原来手写的可折叠标题），点击时只切换 `collapsedSections[key]` 并调用 `this.refreshDomState()`；真正的显隐交给紧跟其后的 `{ type: 'group', visible: () => !collapsed, items }`——框架原生处理隐藏（大概率是直接给整个 group 的容器元素设置隐藏），不再需要旧版那种 `.heading-collapsed + .content { display: none; }` 的 CSS 相邻兄弟选择器技巧，可以删掉：
+
+```typescript
+private renderSectionHeading(key: string, title: string) {
+    return (setting: Setting): void => {
+        const headingEl = setting.settingEl;
+        headingEl.empty();
+        headingEl.className = 'setting-item setting-item-heading my-collapsible-heading'
+            + (this.isCollapsed(key) ? ' is-collapsed' : '');
+        // ...手动建 nameEl / arrow span，和迁移前一致...
+        headingEl.addEventListener('click', () => {
+            const nowCollapsed = !this.isCollapsed(key);
+            this.plugin.settings.collapsedSections[key] = nowCollapsed;
+            headingEl.toggleClass('is-collapsed', nowCollapsed);
+            void this.plugin.saveSettings();
+            this.refreshDomState();   // 只重估 visible 谓词，不整体重渲染
+        });
+    };
+}
+```
+
+**两种重渲染入口，按改动性质选：** `this.update()` 重新调用 `getSettingDefinitions()` 并整体重渲染——用在会改变*渲染文本本身*的场景（如切换语言后 `name`/`desc` 都是求值一次的静态字符串，不会自动跟着语言状态变化，必须整体重建）。`this.refreshDomState()` 只重估每个 definition 的 `visible`/`disabled` 谓词函数并原地切 CSS，不重建 DOM——用在结构不变、只是某一行该不该显示发生变化的场景（分组折叠、"高级选项开启后才显示的附属字段"），比整体 `update()` 更轻量，是这两种场景下的官方推荐用法（文档原文："Cheap: toggles CSS state in place, no re-render."）。
+
+**别忘了同步升 `manifest.json` 的 `minAppVersion` 到 `"1.13.0"`**（`getSettingDefinitions`/`refreshDomState`/`update` 均标注 `@since 1.13.0`）——否则会立刻触发本文档"`no-unsupported-api`"一节描述的问题。这是一次真正的破坏性提升（老版本 Obsidian 用户将无法更新到这个版本的插件），迁移前应与维护者确认可以接受。
+
+**⚠️ 真实案例：这个破坏性提升曾经被直接 revert（obsidian-minimalism-ui，commit `f56f8f0`，2026-07-14）。** 该仓库 `minAppVersion` 长期锁定在 `1.7.2`，早先按上面的做法把 `display()` 整个删掉、只留 `getSettingDefinitions()`，随手把 `minAppVersion`/`versions.json` 一并升到 `1.13.0`——维护者随后判断"为了搜索索引这一个次要收益，切断所有 1.7.2–1.12.x 用户的更新通道不划算"，整体回退回纯 `display()` 实现。**如果 `minAppVersion` 是否可以提升尚未和维护者确认，不要默认走"删掉 display()、单路径迁移"这条路**，改用不破坏兼容性的双路径方案（同一仓库 2026-07-21 重新实施、这次未回退）：
+
+1. **`display()` 原样保留，不删**——它是 obsidian.d.ts 官方注释里写明的"Only implement `display()` as a fallback for plugins that need to support Obsidian versions older than 1.13.0"，两个方法并存本身就是受支持的用法，不是过渡期的权宜之计。
+2. **`getSettingDefinitions()`/`display()` 共用同一批 `configureX(setting: Setting)` 私有方法**（每个方法接收一个已存在的 `Setting` 实例并 `.setName()/.addToggle()/...`），`display()` 里用 `configureX(new Setting(sectionEl))` 调用，`getSettingDefinitions()` 的 `render` 回调里用 `configureX(setting)` 调用同一份逻辑——完全不必为了迁移复制一份 onChange 逻辑，也不会出现两份实现各自维护、逐渐漂移的风险。
+3. **任何会被两条路径共用、且内部调用 `this.update()`/`this.refreshDomState()` 的代码（例如切换语言后要重渲染），必须加运行时存在性判断，不能直接假设该方法存在**：
+
+   ```typescript
+   // ✅ — update() 只在 Obsidian >= 1.13 的 SettingTab 基类原型上才有；
+   // 旧版本运行时 this.update 是 undefined，直接调用会抛 TypeError
+   private refreshTab(): void {
+       if (typeof this.update === 'function') {
+           this.update();       // >= 1.13：重新走 getSettingDefinitions() 声明式重渲染
+       } else {
+           this.display();      // < 1.13：display() 是唯一被调用的路径，手动重跑它
+       }
+   }
+   ```
+
+   反过来，**只被 `getSettingDefinitions()` 自己内部逻辑调用、`display()` 路径完全不会触碰**的代码（例如自定义可折叠分组标题的点击回调，见上面 `renderSectionHeading`）不需要这层判断——它能被执行到，就说明当前运行时一定是 `>= 1.13`（因为老版本压根不会调用 `getSettingDefinitions()`），`this.refreshDomState()` 可以直接裸调用。
+4. **`manifest.json`/`versions.json` 保持原值不变**——双路径方案不使用任何仅在新版本存在的 API 作为"唯一路径"，因此不触发 `no-unsupported-api`，也不需要与维护者商量 breaking change。
+
+判断信号：审核报告要求"用 `getSettingDefinitions` 替代 `display`"时，先确认这个仓库的 `manifest.json` 是否有理由保持低 `minAppVersion`（付费/学习成本敏感的用户群、仓库历史里是否已有类似 revert 记录）——`git log --oneline -- manifest.json` 或直接搜 `revert.*minAppVersion` 能看到类似 `f56f8f0` 这种前车之鉴。没有强烈理由要 breaking change 时，双路径永远是更安全的默认选择。
 
 ## 依赖项检查（submission bot 扫描）
 
