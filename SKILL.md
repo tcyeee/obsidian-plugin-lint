@@ -1,6 +1,6 @@
 ---
 name: obsidian-plugin-lint
-description: Use when asked to lint, check, or review an Obsidian plugin's CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate", "Unexpected browser feature", "Unexpected unknown type selector", "Unsafe assignment to innerHTML", "Sets styles directly instead of using CSS classes", "Unsafe call of an error or any typed value", "Unsafe member access on an error or any typed value", "Unsafe assignment of an error or any typed value", "Passes unsafe values into typed parameters", "This assertion is unnecessary since the receiver accepts the original type of the expression", "This assertion is unnecessary since it does not change the type of the expression", "overrides all other types in this union type", "display is deprecated", "Use getSettingDefinitions instead". Also handles the "/obsidian-plugin-publish [version]" release workflow — commit outstanding work, generate version.md from git history since the last release tag, bump manifest.json/package.json, tag, and push to trigger the release pipeline. Triggers on "/obsidian-plugin-publish", "发布插件", "打个 release", "bump version and tag".
+description: Use when asked to lint, check, or review an Obsidian plugin's CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate", "Unexpected browser feature", "Unexpected unknown type selector", "Unsafe assignment to innerHTML", "Sets styles directly instead of using CSS classes", "Unsafe call of an error or any typed value", "Unsafe member access on an error or any typed value", "Unsafe assignment of an error or any typed value", "Passes unsafe values into typed parameters", "This assertion is unnecessary since the receiver accepts the original type of the expression", "This assertion is unnecessary since it does not change the type of the expression", "overrides all other types in this union type", "display is deprecated", "Use getSettingDefinitions instead", "Creating and attaching \"style\" elements is not allowed", "Uses Obsidian APIs newer than the declared minAppVersion". Also handles the "/obsidian-plugin-publish [version]" release workflow — commit outstanding work, generate version.md from git history since the last release tag, bump manifest.json/package.json, tag, and push to trigger the release pipeline. Triggers on "/obsidian-plugin-publish", "发布插件", "打个 release", "bump version and tag".
 ---
 
 # Obsidian Plugin Lint
@@ -276,6 +276,66 @@ activeDocument.head.createEl('style', {
     text: css,
 });
 ```
+
+**⚠️ 2026-07-22 更正——上面 `<style>` 那个例子的"修复"是错的，只是换了创建方法，没有解决真正的违规。** 同一处代码（`ThemeLoader.ts:43`）按上面的建议从 `document.createElement('style')` 改成 `activeDocument.head.createEl('style', ...)` 后提交审核，被官方判定为一条全新的、**Error 级别**（直接拒绝发布）的违规：
+
+```
+Creating and attaching "style" elements is not allowed. For loading CSS, use a "styles.css" file
+instead, which Obsidian loads for you.
+```
+
+**这条规则和"该用 `createEl` 还是 `document.createElement`"完全无关——Obsidian 插件审核禁止运行时创建并挂载*任何* `<style>` 元素，不管用哪个 DOM API 创建、不管挂在 `<head>` 还是别处。** `createEl('style', ...)` 只是解决了"该用哪个方法创建 DOM 节点"这个（次要的）风格问题，但"创建一个 `<style>` 节点并把它接到文档树上"这个动作本身就是被禁止的，无论方法多干净都一样违规。真正的修复方向是**把运行时才决定注入的 CSS 改为随 `styles.css` 静态分发**：
+
+```typescript
+// ❌ — 无论用 document.createElement 还是 activeDocument.head.createEl，
+// "运行时创建并挂载 <style> 元素"这个动作本身就违规
+export class ThemeLoader {
+    apply() {
+        this.remove();
+        const css = THEME_CSS[this.settings().theme];
+        activeDocument.head.createEl('style', { attr: { 'data-my-theme': name }, text: css });
+    }
+    remove() {
+        activeDocument.head.querySelectorAll('style[data-my-theme]').forEach(el => el.remove());
+    }
+}
+
+// ✅ — 主题 CSS 的源码（theme/<name>/<name>.css）已经收敛在 body.minimalism-ui-theme-<name>
+// 选择器下，多个主题的规则可以同时静态存在于同一份 styles.css 里、互不覆盖——运行时
+// 只需要切 body 上的类名来"选中"哪一段生效，完全不需要注入/移除任何 <style> 节点
+export class ThemeLoader {
+    apply() {
+        this.remove();
+        const name = this.settings().theme;
+        if (name) activeDocument.body.classList.add(`minimalism-ui-theme-${name}`);
+    }
+    remove() {
+        const cls = activeDocument.body.classList;
+        Array.from(cls).filter(c => c.startsWith('minimalism-ui-theme-')).forEach(c => cls.remove(c));
+    }
+}
+```
+
+**把 CSS 折进静态 `styles.css`的构建步骤**：如果原来的动机是"多主题/多套 CSS 太大，不想全部塞进一份 CSS"，唯一合规的出路是让构建脚本把各主题 CSS 拼接进仓库里那份会被提交、会被 CI 直接打进 release 的 `styles.css`（用一对标记注释包住生成区间，脚本每次整段替换，保持幂等；手改仍然改 `theme/<name>/<name>.css` 源文件，不要手改标记之间的内容）：
+
+```javascript
+// scripts/generate-theme-assets.mjs（构建前置步骤，dev/build 都会跑）
+const BEGIN = '/* GENERATED-THEME-CSS:BEGIN */', END = '/* GENERATED-THEME-CSS:END */';
+const stylesSrc = readFileSync('styles.css', 'utf8');
+const i = stylesSrc.indexOf(BEGIN), j = stylesSrc.indexOf(END);
+const block = themeNames.map(n => readFileSync(`theme/${n}/${n}.css`, 'utf8').trim()).join('\n\n');
+writeFileSync('styles.css', stylesSrc.slice(0, i + BEGIN.length) + '\n\n' + block + '\n\n' + stylesSrc.slice(j));
+```
+
+**字体不受这条规则影响，不用跟着改**：`FontFace` API（`new FontFace(...)` + `document.fonts.add(...)`）注册的是字体，不创建/挂载 `<style>`/`<link>` 元素，这条禁令管不到它——`FontLoader` 之类通过 base64 内嵌 + `FontFace` 加载字体的机制原样保留即可，只有"把 CSS 规则文本塞进 `<style>` 标签再插入文档"这一类操作会被这条规则命中。
+
+**排查方法**：这条规则和"是否用了 `document.createElement`"这个信号完全脱钩——`createEl('style', ...)` 一样会中招。改查*创建目标是不是 `'style'` 这个 tag*，不管调用的是哪个 DOM 方法：
+
+```bash
+grep -rn "createElement(.style.\|createEl(.style.\|createEl(\"style\"" src/ main.ts
+```
+
+命中任何一行，无论用的是 `document.createElement` 还是 Obsidian 的 `createEl`，都要按上面的思路整体挪到静态 `styles.css`，不能只换 API。
 
 ```bash
 grep -n "document\.createElement" src/*.ts
@@ -1087,28 +1147,16 @@ private renderSectionHeading(key: string, title: string) {
 
 **别忘了同步升 `manifest.json` 的 `minAppVersion` 到 `"1.13.0"`**（`getSettingDefinitions`/`refreshDomState`/`update` 均标注 `@since 1.13.0`）——否则会立刻触发本文档"`no-unsupported-api`"一节描述的问题。这是一次真正的破坏性提升（老版本 Obsidian 用户将无法更新到这个版本的插件），迁移前应与维护者确认可以接受。
 
-**⚠️ 真实案例：这个破坏性提升曾经被直接 revert（obsidian-minimalism-ui，commit `f56f8f0`，2026-07-14）。** 该仓库 `minAppVersion` 长期锁定在 `1.7.2`，早先按上面的做法把 `display()` 整个删掉、只留 `getSettingDefinitions()`，随手把 `minAppVersion`/`versions.json` 一并升到 `1.13.0`——维护者随后判断"为了搜索索引这一个次要收益，切断所有 1.7.2–1.12.x 用户的更新通道不划算"，整体回退回纯 `display()` 实现。**如果 `minAppVersion` 是否可以提升尚未和维护者确认，不要默认走"删掉 display()、单路径迁移"这条路**，改用不破坏兼容性的双路径方案（同一仓库 2026-07-21 重新实施、这次未回退）：
+**⚠️ 真实案例：这个破坏性提升曾经被直接 revert（obsidian-minimalism-ui，commit `f56f8f0`，2026-07-14）。** 该仓库 `minAppVersion` 长期锁定在 `1.7.2`，早先按上面的做法把 `display()` 整个删掉、只留 `getSettingDefinitions()`，随手把 `minAppVersion`/`versions.json` 一并升到 `1.13.0`——维护者随后判断"为了搜索索引这一个次要收益，切断所有 1.7.2–1.12.x 用户的更新通道不划算"，整体回退回纯 `display()` 实现。
 
-1. **`display()` 原样保留，不删**——它是 obsidian.d.ts 官方注释里写明的"Only implement `display()` as a fallback for plugins that need to support Obsidian versions older than 1.13.0"，两个方法并存本身就是受支持的用法，不是过渡期的权宜之计。
-2. **`getSettingDefinitions()`/`display()` 共用同一批 `configureX(setting: Setting)` 私有方法**（每个方法接收一个已存在的 `Setting` 实例并 `.setName()/.addToggle()/...`），`display()` 里用 `configureX(new Setting(sectionEl))` 调用，`getSettingDefinitions()` 的 `render` 回调里用 `configureX(setting)` 调用同一份逻辑——完全不必为了迁移复制一份 onChange 逻辑，也不会出现两份实现各自维护、逐渐漂移的风险。
-3. **任何会被两条路径共用、且内部调用 `this.update()`/`this.refreshDomState()` 的代码（例如切换语言后要重渲染），必须加运行时存在性判断，不能直接假设该方法存在**：
+**⚠️⚠️ 2026-07-22 更正——下面这条"双路径方案"本身是错的，已被官方审核实测证伪，不要再用。** 2026-07-21 曾在这里记录过一个"不破坏兼容性"的双路径方案：`display()` 和 `getSettingDefinitions()` 并存，把所有 `this.update()`/`this.refreshDomState()` 调用都包一层 `typeof this.update === 'function'` 运行时判断，理由是"老版本运行时这两个方法不存在，加判断后不会抛错，minAppVersion 就不用动"。这套方案提交审核后，**被 Obsidian 官方审核直接判定为 `obsidianmd/no-unsupported-api` Error**（"Uses Obsidian APIs newer than the declared minAppVersion"），精确命中了那个 `typeof this.update === 'function'` 判断内部的 `this.update()` 调用行、以及 `renderSectionHeading` 里裸调用的 `this.refreshDomState()` 行——**审核机器人做的是纯静态分析：只看"这个调用点引用的 API 签名版本是否 ≤ minAppVersion"，完全不理解、也不执行任何运行时判断逻辑**。换句话说，`no-unsupported-api` 检查的是*文本里出现的调用点*，不是*运行时是否可达*——哪怕这行代码被包在一个只在新版本才会为真的 `if` 分支里，只要它在源码里以文本形式引用了 `SettingTab.update`/`refreshDomState`，机器人就会报错，且是 Error 级别（直接拒绝发布），不是 Warning。
 
-   ```typescript
-   // ✅ — update() 只在 Obsidian >= 1.13 的 SettingTab 基类原型上才有；
-   // 旧版本运行时 this.update 是 undefined，直接调用会抛 TypeError
-   private refreshTab(): void {
-       if (typeof this.update === 'function') {
-           this.update();       // >= 1.13：重新走 getSettingDefinitions() 声明式重渲染
-       } else {
-           this.display();      // < 1.13：display() 是唯一被调用的路径，手动重跑它
-       }
-   }
-   ```
+**正确结论：只要 `minAppVersion` 不打算提升到 `1.13.0`，`getSettingDefinitions()`/`this.update()`/`this.refreshDomState()` 就不能出现在这个文件的任何代码路径里，无论是否加运行时守卫。** 没有"鱼与熊掌兼得"的中间方案——两条路只能二选一：
 
-   反过来，**只被 `getSettingDefinitions()` 自己内部逻辑调用、`display()` 路径完全不会触碰**的代码（例如自定义可折叠分组标题的点击回调，见上面 `renderSectionHeading`）不需要这层判断——它能被执行到，就说明当前运行时一定是 `>= 1.13`（因为老版本压根不会调用 `getSettingDefinitions()`），`this.refreshDomState()` 可以直接裸调用。
-4. **`manifest.json`/`versions.json` 保持原值不变**——双路径方案不使用任何仅在新版本存在的 API 作为"唯一路径"，因此不触发 `no-unsupported-api`，也不需要与维护者商量 breaking change。
+- **A. 提升 `minAppVersion` 到 `1.13.0`**，只保留 `getSettingDefinitions()`，删掉 `display()`——这是 obsidian.d.ts 注释和大多数指南默认假设的路径，但代价是切断所有 `1.7.2`–`1.12.x` 用户的更新通道，必须与维护者确认这个代价可接受（该仓库两次判断都是不接受）。
+- **B. 完全不实现 `getSettingDefinitions()`，只保留 `display()`。** 审核报告里"does not implement getSettingDefinitions()"这条留作永久性的、不可修的 Warning/Recommendation（不是 Error，不阻断发布）——这是唯一在保持低 `minAppVersion` 前提下能通过审核的选择。`configureX(setting: Setting)` 这种把每个设置项的构建逻辑拆成独立私有方法、被 `display()` 里的 `new Setting(sectionEl)` 调用的写法仍然是好的代码组织，可以保留，只是不要再画蛇添足地为它们外加一层 `getSettingDefinitions()` 声明式包装。
 
-判断信号：审核报告要求"用 `getSettingDefinitions` 替代 `display`"时，先确认这个仓库的 `manifest.json` 是否有理由保持低 `minAppVersion`（付费/学习成本敏感的用户群、仓库历史里是否已有类似 revert 记录）——`git log --oneline -- manifest.json` 或直接搜 `revert.*minAppVersion` 能看到类似 `f56f8f0` 这种前车之鉴。没有强烈理由要 breaking change 时，双路径永远是更安全的默认选择。
+判断信号：审核报告要求"用 `getSettingDefinitions` 替代 `display`"，且这个仓库的 `minAppVersion` 有明确理由保持低版本时（`git log --oneline -- manifest.json` 能看到类似 `f56f8f0` 这种明确的历史决定），直接选方案 B，不要尝试任何"运行时守卫 + 双路径"的折中——那条路已经被实测堵死。
 
 ## 依赖项检查（submission bot 扫描）
 
