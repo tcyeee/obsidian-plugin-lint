@@ -1,6 +1,7 @@
 ---
 name: obsidian-plugin-lint
-description: Use when asked to lint, check, or review an Obsidian plugin's CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate", "Unexpected browser feature", "Unexpected unknown type selector", "Unsafe assignment to innerHTML", "Sets styles directly instead of using CSS classes", "Unsafe call of an error or any typed value", "Unsafe member access on an error or any typed value", "Unsafe assignment of an error or any typed value", "Passes unsafe values into typed parameters", "This assertion is unnecessary since the receiver accepts the original type of the expression", "This assertion is unnecessary since it does not change the type of the expression", "overrides all other types in this union type", "display is deprecated", "Use getSettingDefinitions instead", "Creating and attaching \"style\" elements is not allowed", "Uses Obsidian APIs newer than the declared minAppVersion". Also handles the "/obsidian-plugin-publish [version]" release workflow — commit outstanding work, generate version.md from git history since the last release tag, bump manifest.json/package.json, tag, and push to trigger the release pipeline. Triggers on "/obsidian-plugin-publish", "发布插件", "打个 release", "bump version and tag".
+description: 'Use when asked to lint, check, or review an Obsidian plugin''s CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate", "Unexpected browser feature", "Unexpected unknown type selector", "Unsafe assignment to innerHTML", "Sets styles directly instead of using CSS classes", "Unsafe call of an error or any typed value", "Unsafe member access on an error or any typed value", "Unsafe assignment of an error or any typed value", "Passes unsafe values into typed parameters", "This assertion is unnecessary since the receiver accepts the original type of the expression", "This assertion is unnecessary since it does not change the type of the expression", "overrides all other types in this union type", "display is deprecated", "Use getSettingDefinitions instead", "does not implement getSettingDefinitions", "will not appear in Obsidian''s settings search", "Creating and attaching "style" elements is not allowed", "Uses Obsidian APIs newer than the declared minAppVersion". Also handles the "/obsidian-plugin-publish [version]" release workflow — commit outstanding work, generate version.md from git history since the last release tag, bump manifest.json/package.json, tag, and push to trigger the release pipeline. Triggers on "/obsidian-plugin-publish", "发布插件", "打个 release", "bump version and tag".'
+model: haiku
 ---
 
 # Obsidian Plugin Lint
@@ -34,7 +35,7 @@ Source: https://github.com/obsidianmd/eslint-plugin
 | Avoid `!important` | Any `!important` declaration | Add `.workspace` parent selector to raise specificity |
 | Full 6-digit hex | Shorthand hex `#fff`, `#aaa`, `#ccc`, `#888` | Expand to 6 digits: `#ffffff`, `#aaaaaa`, `#cccccc`, `#888888` |
 | No duplicate properties | Same property declared twice in one rule block (e.g. `position: fixed` repeated) | Remove the duplicate; keep the intended declaration |
-| Avoid `:has()` | Any `:has()` selector — broad selector invalidation hurts performance | Structural: target the matched element's own class. State-based: JS toggles a marker class, key CSS off it |
+| Avoid `:has()` | Any `:has()` selector — broad selector invalidation hurts performance | Structural: target the matched element's own class. State-based: JS toggles a marker class, key CSS off it. Content-based (nothing in the note to target): mark the rendered DOM in both views, key CSS off the mark |
 | Browser feature compatibility | Properties only partially supported by Obsidian's Electron/Chromium version (`clip-path`, `column-count`, `box-decoration-break`, newer `text-decoration-*` sub-properties) | Add vendor prefixes or avoid the feature; see section below |
 | No unknown type selectors | Non-standard HTML element names in selectors (`webview`, `mjx-container`) | Use class selectors instead, or acknowledge as intentional third-party elements |
 
@@ -48,8 +49,37 @@ grep -n '!important' styles.css
 
 For each hit:
 
-1. Try adding `.workspace` as parent — outranks Obsidian's base rules (which don't use `!important` on these properties)
-2. If Obsidian itself uses `!important` on the same property, keep it and document why
+1. **First compute specificity instead of guessing** — before adding a `.workspace` prefix, check whether the existing selector *already* outranks every competing Obsidian rule on that property. Count (id, class, type) per selector (`:is()`/`:not()` contribute the specificity of their most specific argument, not an extra level) and compare against the native rules in `app.css` touching the same property/element. If the plugin's selector is already higher, `!important` is simply unused weight — drop it with no other change.
+2. If it is *not* already higher, add `.workspace` as parent (or another real ancestor class) — outranks Obsidian's base rules (which don't use `!important` on these properties)
+3. If Obsidian itself uses `!important` on the same property, keep it and document why
+
+**Worked example (obsidian-minimalism-ui, 2026-11-06)** — `!important` added defensively in a ribbon-hiding fix, flagged by the submission bot:
+
+```css
+/* Before */
+body.minimalism-ui-mac-sidebar .workspace-ribbon.side-dock-ribbon:is(.mod-left, .mod-primary) {
+	display: none !important;
+}
+```
+
+Competing native rules in `app.css`:
+
+| Selector | Specificity (id, class, type) |
+|---|---|
+| `.workspace-ribbon { display: flex; }` | (0,1,0) |
+| `body:not(.show-ribbon) .workspace-ribbon { display: none; }` | (0,2,1) |
+| Plugin's selector (4 classes incl. `:is()`, + `body`) | **(0,4,1)** |
+
+The plugin's selector already outranks both native rules without `!important` — neither native rule uses `!important` either, so specificity alone decides it regardless of which state (`show-ribbon` present or not) the body is in:
+
+```css
+/* After — same selector, just drop !important */
+body.minimalism-ui-mac-sidebar .workspace-ribbon.side-dock-ribbon:is(.mod-left, .mod-primary) {
+	display: none;
+}
+```
+
+Only reach for `.workspace`-prefixing or keeping `!important` when the specificity table actually shows the plugin's selector losing.
 
 Applies to all properties (`display`, `pointer-events`, `overflow`, `overflow-y`, etc.):
 
@@ -124,7 +154,7 @@ Remove the earlier (usually leftover) duplicate and keep the final intended decl
 grep -n ':has(' styles.css theme/*.css
 ```
 
-Two patterns, two different fixes:
+Three patterns, three different fixes:
 
 ### 1. Structural — `:has(> .child)` selects a parent by its child
 
@@ -166,6 +196,121 @@ activeDocument.addEventListener('focusout', () => activeWindow.setTimeout(sync, 
 ```
 
 Implement as a `Feature` (apply/remove) so listeners are torn down on unload. For non-focus state (class/attribute toggled by another plugin), drive the same marker-class toggle from a `MutationObserver` instead of focus events.
+
+### 3. Content — `:has()` identifies *what the user wrote*, and there is no class to target
+
+The hardest case, and the one that looks unfixable at first: `:has()` isn't encoding structure or runtime state, it's asking "does this element contain the thing my plugin produced?" Typical of plugins whose output is **plain Markdown with no marker in the note** (a deliberate invariant: the note must keep rendering with the plugin uninstalled), so the only signal is a content feature of the rendered DOM — an inlined `data:` image, a specific `href`, an emoji.
+
+```css
+/* Before — obsidian-better-link-display, 17 warnings, 2026-08-15 */
+a.external-link:has(> img[src^="data:image/"]) { color: var(--text-muted); }
+.cm-editor .cm-line:has(img[src^="data:image/"]) .cm-link { color: var(--text-muted); }
+```
+
+Neither fix above applies: the parent has no class of its own (#1), and nothing toggles at runtime (#2). **The fix is to do the recognition once in JS, on the rendered DOM, and leave a marker class behind for CSS** — the note still gets nothing written into it, because the marks only ever exist on rendered elements.
+
+```css
+/* After — every rule keys off a class the plugin put there */
+a.external-link.better-link-display-bookmark { color: var(--text-muted); }
+.cm-editor .cm-line.better-link-display-line .cm-link { color: var(--text-muted); }
+```
+
+**It has to be done for each view separately — Reading view and Live Preview render the same Markdown into different DOM** (which is exactly why these rules came in mirrored pairs to begin with), and inside Live Preview the mechanism differs *again* depending on who owns the element:
+
+```typescript
+// main.ts
+this.registerMarkdownPostProcessor((el) => markReadingViewBookmarks(el));   // Reading view
+this.registerEditorExtension(bookmarkMarkers);                              // Live Preview
+```
+
+**① Reading view — plain DOM marking in a Markdown post-processor.** Nothing else owns that DOM, and each block is passed in as it is rendered:
+
+```typescript
+export function markReadingViewBookmarks(el: Element): void {
+    for (const icon of Array.from(el.querySelectorAll(ICON_SELECTOR)))
+        icon.closest("a.external-link")?.addClass(BOOKMARK_CLASS);
+}
+```
+
+**⚠️ ② Live Preview, `.cm-line` — you cannot mark it in the DOM. CodeMirror will strip the class.** This is the trap that makes the naive "just `querySelectorAll` the editor and `addClass`" version look like it works and then flicker. CodeMirror's `DOMObserver` observes the content DOM with `attributes: true, subtree: true`; a foreign class on a `.cm-line` produces a mutation record, `readMutation()` finds the `LineView` (which, unlike a widget, does **not** ignore mutations), and flags it `AttrsDirty` — and `LineView.sync()` then does exactly this:
+
+```javascript
+// node_modules/@codemirror/view/dist/index.js — LineView.sync()
+else if (this.flags & 4 /* ViewFlag.AttrsDirty */) {
+    clearAttributes(this.dom);
+    this.dom.className = "cm-line";     // ← your class, gone
+```
+
+So the class survives until the next sync of that line and then vanishes, with no update to re-add it. **Use a `Decoration.line` instead** — the supported way to put a class on a line, and a bonus: it's computed from the *document text*, so it doesn't depend on a render having happened yet.
+
+```typescript
+const lineMark = Decoration.line({ class: LINE_CLASS });
+
+function bookmarkLines(view: EditorView): DecorationSet {
+    const marks: Range<Decoration>[] = [];
+    const { doc, selection } = view.state;
+    let lastMarked = -1;
+    for (const { from, to } of view.visibleRanges) {
+        for (let pos = from; pos <= to; ) {
+            const line = doc.lineAt(pos);
+            pos = line.to + 1;
+            // Two visible ranges can meet inside one line — never mark twice at one pos.
+            if (line.from <= lastMarked || !line.text.includes(ICON_MARKUP)) continue;
+            // Live Preview shows the raw Markdown on the line being edited, so the
+            // rendered-look styling must not land there.
+            if (selection.ranges.some((r) => r.from <= line.to && r.to >= line.from)) continue;
+            marks.push(lineMark.range(line.from));
+            lastMarked = line.from;
+        }
+    }
+    return Decoration.set(marks);
+}
+```
+
+Recompute on `docChanged || viewportChanged || selectionSet` — don't narrow to `docChanged`, because moving the caret onto a line swaps the widget back for raw Markdown **without changing a character**.
+
+**③ Live Preview, inside an Obsidian widget (`.image-embed`, rendered links) — DOM marking is safe here**, precisely because `WidgetView.ignoreMutation()` returns `true`: CodeMirror treats widget innards as foreign territory and never re-syncs their attributes. Worth doing when a line class would be too coarse (a line can hold a bookmark *and* an ordinary image). **But a `ViewPlugin`'s `update()` runs *before* CodeMirror syncs its DOM**, so marking there reads the previous render — queue it into the measure phase, whose `write` callback is the phase meant for DOM writes:
+
+```typescript
+export const bookmarkMarkers = ViewPlugin.fromClass(
+    class {
+        decorations: DecorationSet;
+        constructor(private readonly view: EditorView) {
+            this.decorations = bookmarkLines(view);
+            this.scheduleEmbedPass();
+        }
+        update(update: ViewUpdate): void {
+            if (update.docChanged || update.viewportChanged || update.selectionSet)
+                this.decorations = bookmarkLines(update.view);
+            this.scheduleEmbedPass();
+        }
+        private scheduleEmbedPass(): void {
+            this.view.requestMeasure({
+                key: this,                                   // dedupe: one pass per cycle
+                read: () => null,
+                write: () => syncEmbedMarks(this.view.contentDOM),
+            });
+        }
+    },
+    { decorations: (markers) => markers.decorations }
+);
+
+// Remove-then-add, not add-only: an element can outlive the content that earned its mark.
+function syncEmbedMarks(root: Element): void {
+    for (const marked of Array.from(root.querySelectorAll(`.${EMBED_CLASS}`)))
+        if (!marked.querySelector(ICON_SELECTOR)) marked.removeClass(EMBED_CLASS);
+    for (const icon of Array.from(root.querySelectorAll(ICON_SELECTOR)))
+        icon.closest(".image-embed")?.addClass(EMBED_CLASS);
+}
+```
+
+Cost check: each pass is two `querySelectorAll` calls over the viewport (CodeMirror keeps only visible lines in the DOM) — precisely the work `:has()` was making the engine redo on every invalidation. `classList.add` of a class that is already there mutates nothing, so the steady state produces no mutation records and no loop.
+
+> Don't reach for `docViewUpdate()` (the `PluginValue` hook that *is* called after the DOM sync): it arrived in @codemirror/view 6.36, and the CodeMirror build a given Obsidian version bundles is not the one in your `devDependencies`. `requestMeasure` has been there since 6.0.
+>
+> Specificity check after the rewrite: `a.external-link:has(> img[src^="…"])` is (0,2,2), while `a.external-link.better-link-display-bookmark` is (0,2,1) — one notch lower. It still wins against Obsidian's own `a.external-link` rules on source order (plugin CSS loads after `app.css`), but if a rule stops taking effect, this is the first thing to check.
+>
+> How to check an ownership question like this for yourself, instead of guessing: the answer is in `node_modules/@codemirror/view/dist/index.js` — `grep -n "observeOptions" -A8` for what the observer watches, `grep -n "readMutation(rec)" -A8` for what it does with a record, and `grep -n "ignoreMutation" -A3` for which view classes opt out (`WidgetView` and `BlockWidgetView` return `true`; the base `ContentView`, and therefore `LineView`, returns `false`).
 
 ## Checking JS/TS for inline style assignment
 
@@ -568,6 +713,18 @@ const zip = zipSync(files, { level: 6 });
 
 不确定库的真实返回类型时，别猜——直接查 `node_modules/<pkg>/**/*.d.ts` 里的函数签名，或用 TS 官方 API 现场核实（见下方"核实陈旧报告"）。
 
+**同类陷阱的 Obsidian 官方 API 版本（实测案例，obsidian-minimalism-ui，2026-11-06）**：`leaf.getViewState().state as Record<string, unknown> | undefined` 这类写法，先查 `node_modules/obsidian/obsidian.d.ts` 里 `ViewState` 接口的 `state` 字段声明——它本身就是 `state?: Record<string, unknown>`，断言目标与官方声明完全一致，断言不改变任何类型，直接删掉：
+
+```typescript
+// ❌ — ViewState.state 在 obsidian.d.ts 里已声明为 Record<string, unknown> | undefined
+const state = leaf.getViewState().state as Record<string, unknown> | undefined;
+
+// ✅
+const state = leaf.getViewState().state;
+```
+
+遇到类似断言，先 `grep -n "interface ViewState" -A5 node_modules/obsidian/obsidian.d.ts`（或任意涉及的 Obsidian 接口）核实官方字段类型，而不是假设它是 `any` 后去猜断言是否必要。
+
 **⚠️ 第三类陷阱——`as` 断言本身就是让类型"看起来不需要断言"的原因，删掉后类型会真的变宽（实测案例，obsidian-image-cluster，2026-07-10）**：`Element.prototype.closest<E extends Element = Element>(selectors: string): E | null` 是泛型方法，`E` 默认收窄为 `Element`。当写成 `el.closest(".cm-editor") as HTMLElement | null` 时，TypeScript 会把 `as` 右边的类型当作**上下文类型**反向喂给 `closest<E>` 的泛型推断（这是 TS 对括在 `as` 里的表达式做上下文类型标注的通用行为，不是 `closest` 特有的），于是 `E` 被推成 `HTMLElement`——断言写出来之后，表达式自己的类型就已经等于断言目标，`no-unnecessary-type-assertion` 因此判定"断言不改变类型"而报多余。**但这是循环论证式的假象**：断言之所以"不改变类型"，恰恰是因为断言本身才是让 `E` 被推成 `HTMLElement` 的原因——按标准做法直接删掉 `as`，`E` 会失去这个上下文提示，退回默认值 `Element`，类型真的变宽了：
 
 ```typescript
@@ -804,6 +961,18 @@ private get leftSplit(): WorkspaceSidedock | null {
 ```
 
 > 判断信号：断言链路是 `as unknown as X`，且断言结果被直接 `return`/传参/赋值给一个类型早已声明为兼容 `X`（或更宽）的位置——先看接收方的类型声明，而不是表达式自身的控制流收窄。
+
+同一变体的另一种常见形态：**泛型函数的形参，`T` 已由*另一个*实参推断确定，于是这个实参上的 `as T` 纯属多余**（实测，obsidian-better-link-display `src/lookup.ts:53`，2026-08-15）。这里容易犹豫"删了会不会退化成宽类型"（那是上面 `closest<E>` 那条陷阱的情形），判据是**看 `T` 是从哪里推断出来的**：若另有一个实参已经把 `T` 钉死，被报告的这个实参只是被*检查*、不参与推断，删掉断言后对象字面量会被 `T` 上下文类型化（`reason: "timeout"` 照样收窄成字面量类型），不会变宽：
+
+```typescript
+// ❌ — T 由第一个实参 () => Promise<LookupOutcome> 推出，第二个实参的 as 不改变任何一方
+private async withTimeout<T>(task: () => Promise<T>, onTimeout: T): Promise<T>
+return this.withTimeout(() => this.request(url), { ok: false, reason: "timeout" } as LookupOutcome);
+
+// ✅
+return this.withTimeout(() => this.request(url), { ok: false, reason: "timeout" });
+```
+
 
 **第四种变体——通过一个别名布尔变量间接收窄（TS 4.4+ aliased conditions）**：TypeScript 4.4 起支持"别名条件收窄"——`const disabled = !leaf` 这种把某个变量的判空结果存进一个新的 `const` 布尔变量后，后续 `if (disabled) return;` 依然能让 TS 把 `leaf` 收窄为非空，即使收窄发生在一个稍后才调用的闭包内部（只要 `leaf` 本身从未被重新赋值）。这与上面"存进单独变量后 TS 无法收窄，只能写 `x!`"的陷阱刚好相反——`no-unnecessary-type-assertion` 只是运气好命中了 TS 能处理的这一种别名形式，遇到报告先验证是否属于这一种，而不是默认套用"重并判空"的修法：
 
@@ -1156,7 +1325,35 @@ private renderSectionHeading(key: string, title: string) {
 - **A. 提升 `minAppVersion` 到 `1.13.0`**，只保留 `getSettingDefinitions()`，删掉 `display()`——这是 obsidian.d.ts 注释和大多数指南默认假设的路径，但代价是切断所有 `1.7.2`–`1.12.x` 用户的更新通道，必须与维护者确认这个代价可接受（该仓库两次判断都是不接受）。
 - **B. 完全不实现 `getSettingDefinitions()`，只保留 `display()`。** 审核报告里"does not implement getSettingDefinitions()"这条留作永久性的、不可修的 Warning/Recommendation（不是 Error，不阻断发布）——这是唯一在保持低 `minAppVersion` 前提下能通过审核的选择。`configureX(setting: Setting)` 这种把每个设置项的构建逻辑拆成独立私有方法、被 `display()` 里的 `new Setting(sectionEl)` 调用的写法仍然是好的代码组织，可以保留，只是不要再画蛇添足地为它们外加一层 `getSettingDefinitions()` 声明式包装。
 
-判断信号：审核报告要求"用 `getSettingDefinitions` 替代 `display`"，且这个仓库的 `minAppVersion` 有明确理由保持低版本时（`git log --oneline -- manifest.json` 能看到类似 `f56f8f0` 这种明确的历史决定），直接选方案 B，不要尝试任何"运行时守卫 + 双路径"的折中——那条路已经被实测堵死。
+第二个数据点（obsidian-better-link-display，2026-08-15）：`minAppVersion` 是 `1.0.0`，审核同时给出 `does not implement getSettingDefinitions()`（Warning）和 `` `display` is deprecated ``（Recommendation）——当天按方案 B 留着不修，因为这个仓库的整套设计（styles.css 不依赖任何新语法、代码不用任何 1.0.0 之后的 API）就是围绕"尽可能低的 minAppVersion"展开的。**这两条都不是 Error，不阻断发布**；提交前确认报告里它们的级别，别把 Warning 当成必须清零的项而去做破坏性升级。
+
+**⚠️ 2026-08-16 更新——同一个仓库（obsidian-better-link-display）第二天改走了方案 A。** 结论不是"B 是对的、A 是错的"，而是**A/B 是一个产品决策而非技术判断，必须由维护者拍板，不能由代码里的历史痕迹自动推导**：同一个仓库、同一条 Warning、同一个 `minAppVersion 1.0.0` 的设计初衷，隔一天就得到了相反的答案。所以修正上一版这里写的"直接选方案 B"——**正确做法是把两条路的代价摆清楚后问维护者**（A：切断 `1.0.0`–`1.12.x` 用户更新通道，换来设置项进入搜索索引；B：Warning 永久留着，不阻断发布），只有"运行时守卫 + 双路径"那条折中是**技术上**已被实测堵死、不需要问也不能选的。
+
+#### 方案 A 迁移清单（obsidian-better-link-display，2026-08-16 实测走通，`tsc -noEmit` + 32 个单测通过）
+
+除了上面已经写过的 `render`-type 包法、语句体丢弃返回值、`items` 类型收窄之外，这次新踩到/新确认的点：
+
+1. **`display()` 直接删掉即可，不用留空实现。** `SettingTab.display()` 在 1.13 的 `obsidian.d.ts` 里是**非 abstract** 的普通方法（`PluginSettingTab` 本身是 `abstract class`，但没有把 `display` 声明为 abstract），子类不实现照样编译通过。注释原文也确认了语义："Not called when `getSettingDefinitions` returns a non-empty array … Only implement display() as a fallback for plugins that need to support Obsidian versions older than 1.13.0."
+2. **`new Setting(el).setName(x).setHeading()` 的等价物是分组，不是某个 "heading" 型 definition。** 原来靠 `setHeading()` 排出来的"标题 + 若干行"的视觉分组，迁移后写成 `{ type: 'group', heading: t('...'), items: [...] }`；`type` 字段是必填的（`'group' | 'list'`）。
+3. **`SettingDefinitionBase.name` 是必填 `string`——纯展示性的行也得有名字。** 本仓库有一行是"外观预览"（一个假的书签样本，本身没有任何文案），迁移前它靠 `new Setting(el).setName().setDesc()` + 往 `controlEl` 里塞 DOM 实现。definition 里没有"无名行"这种形态，所以 `name`/`desc` 照填，DOM 构建全部挪进 `render` 回调（`setting.controlEl.createDiv(...)`、`setting.settingEl.addClass(...)` 这些在回调里原样可用，因为拿到的就是框架建好的那个 `Setting` 实例）。
+4. **`versions.json` 要补历史条目，光改 `manifest.json` 不够。** `manifest.json` 的 `minAppVersion` 描述的是**下一个**要发的版本，`versions.json` 是"插件版本 → 该版本要求的最低 app 版本"的历史映射表，老版本 Obsidian 靠它回退到最后一个兼容的插件版本。`version-bump.mjs` 是在 `npm version` 时读当时的 manifest 写进去的，所以**必须先确认表里没有缺口再改 manifest**——本仓库 `1.0.2` 已打 tag 发布但 `versions.json` 里漏了这条，如果直接把 manifest 改成 `1.13.0` 就发下一版，1.12 及以下的用户会因为查不到 `1.0.2` 的条目而拿不到最后那个兼容版本：
+
+   ```bash
+   # 对照：已发布的 tag 是否都在 versions.json 里有条目
+   git tag --list; cat versions.json
+   ```
+
+   补完缺口（`"1.0.2": "1.0.0"`）再把 manifest 的 `minAppVersion` 提到 `1.13.0`，下一次 `npm version` 会自动写入新条目。
+5. **升完 `minAppVersion` 顺手回收那些"为了兼容老版本而绕路"的写法。** 这类代码通常在注释里自己写明了原因，grep 注释比 grep API 名更容易找全：
+
+   ```bash
+   grep -rn "minAppVersion\|only exists from\|@since\|Obsidian 1\.[0-9]" src/ main.ts CLAUDE.md README*.md
+   ```
+
+   本仓库命中一处——`button.buttonEl.disabled = true` 外加一句"`ButtonComponent.setDisabled` 只有 1.2.3+ 才有，而 manifest 承诺 1.0.0"的注释，升版后换回 `button.setDisabled(true)` 并删掉注释。同一次 grep 还会把 `README.md` / `README.zh.md` 的 "Requirements: Obsidian 1.0 or later" 和 `CLAUDE.md` 里写死的 minAppVersion 一并翻出来，这些面向用户的版本声明必须跟着改，否则文档会与 manifest 互相矛盾。
+6. **语言切换用 `this.update()`，别用 `refreshDomState()`。** 这条上面已经写过原理，实操时容易选错：`name`/`desc` 是**建 definition 那一刻求值一次**的普通字符串，`refreshDomState()` 只重估 `visible`/`disabled` 谓词、不碰文本，切完语言页面会原样不动。
+
+
 
 ## 依赖项检查（submission bot 扫描）
 
@@ -1248,6 +1445,32 @@ cat manifest.json | grep minAppVersion
 ```
 
 若 `minAppVersion` 低于 API 所需，需二选一：升高 `minAppVersion`，或改用兼容旧版本的替代实现。
+
+**不要靠上面那张表猜版本——`obsidian.d.ts` 每个成员上方就写着 `@since`，直接查。** 报告只给出文件行号（例如 `src/settings.ts:162`），先看那一行调了哪些 Obsidian API，再逐个在类型定义里读它自己的 `@since`（注意：`@since` 挂在**成员**上，不是类上，同一个类里不同方法版本可以差很多）：
+
+```bash
+# 若 node_modules 还没装，先 npm install（obsidian 是 devDependency）
+grep -n -B6 "    setDisabled(disabled: boolean): this;" node_modules/obsidian/obsidian.d.ts
+# → /** @public @since 1.2.3 */ ——这就是该调用点要求的最低版本
+```
+
+**实测案例（obsidian-better-link-display，2026-08-15，Error 级别）**：`manifest.json` 写着 `"minAppVersion": "1.0.0"`，设置页里一句再普通不过的
+
+```typescript
+button.setDisabled(true).setButtonText(t("token.testing"));   // ❌ ButtonComponent.setDisabled: @since 1.2.3
+```
+
+被判 `no-unsupported-api`。**这类"看起来自古就有"的基础组件方法是本条最常见的来源**——`ButtonComponent.setDisabled`(1.2.3)、`setIcon`/`setTooltip`(1.1.0)、`setDestructive`/`removeDestructive`(1.13.0) 都比多数插件声明的 `minAppVersion` 新。
+
+修法除了升 `minAppVersion`，还有第三条常被忽略的路：**当这个 API 只是某个原生 DOM 属性的薄封装时，直接用底层属性，一行改动、零兼容代价**（`Component.xxxEl` 这类 DOM 引用字段本身是老 API，不受影响）：
+
+```typescript
+// ✅ 保持 minAppVersion 1.0.0：setDisabled 内部做的就是这件事
+button.buttonEl.disabled = true;
+button.setButtonText(t("token.testing"));   // setButtonText 是 @since 0.9.7，可以留
+```
+
+> 选择依据：`minAppVersion` 是对用户的兼容性承诺，升它会切断老版本用户的更新通道（同样的权衡见上面 `getSettingDefinitions` 一节）。因此顺序是：① 能用底层 DOM 属性/老签名等价替代 → 替代；② 替代不了（真正的新功能，如 deferred views、声明式设置）→ 升 `minAppVersion` 并同步 `versions.json`，且要跟维护者确认。**改完在代码旁留一句注释说明为什么不用那个更顺手的 API**，否则下一个人会"顺手改回去"。
 
 ```json
 // ❌
@@ -1428,11 +1651,14 @@ Known partially-supported features in Obsidian 1.6.5 / Electron 27:
 | `css-boxdecorationbreak` | `box-decoration-break` | Add `-webkit-box-decoration-break` |
 | `css-text-indent` | `text-indent` with `each-line`/`hanging` keywords | Use plain `text-indent: <length>` without keywords; or drop |
 | `text-decoration` | `text-decoration-thickness`, `text-underline-offset`, `text-decoration-skip-ink`, `text-underline-position` | These newer sub-properties may not render in older Electron; add fallback `text-decoration: underline` and treat sub-properties as progressive enhancement |
+| `css-display-contents` | `display: contents` | No prefixed form exists — restructure the layout so no box needs to disappear; see the worked example below |
 
 ```bash
 # Find affected properties
-grep -rn 'clip-path\|mask-image\|mask:\|column-count\|column-width\|box-decoration-break\|text-indent.*each-line\|text-indent.*hanging\|text-decoration-thickness\|text-underline-offset\|text-decoration-skip-ink\|text-underline-position' styles.css theme/
+grep -rn 'clip-path\|mask-image\|mask:\|column-count\|column-width\|box-decoration-break\|text-indent.*each-line\|text-indent.*hanging\|text-decoration-thickness\|text-underline-offset\|text-decoration-skip-ink\|text-underline-position\|display: *contents' styles.css theme/
 ```
+
+> ⚠️ **The version in the warning text is the bot's own baseline, not your `minAppVersion`.** Observed on **obsidian-image-cluster** (2026-08-15): `manifest.json` declared `"minAppVersion": "1.13.4"`, yet the warning read `only partially supported by Obsidian 1.11.4`. Don't try to "fix" this by raising `minAppVersion` — the bot isn't reading that field for this check, and raising it won't silence the warning. Fix the CSS.
 
 For each hit, either add the vendor-prefixed form immediately before the standard property, or drop it if the visual effect is non-essential:
 
@@ -1446,6 +1672,52 @@ For each hit, either add the vendor-prefixed form immediately before the standar
   clip-path: inset(0 round 4px);
 }
 ```
+
+### `display: contents` — 没有 vendor prefix，只能改布局结构
+
+`display: contents` 的作用是"让这个元素不生成盒子，把它的子元素直接提升为父级布局的参与者"。
+它没有任何 `-webkit-` 前缀形式，`@supports` 降级也没有意义（降级分支要写的就是真正的修复），
+所以**唯一的修法是重新安排布局，让没有任何盒子需要消失**。
+
+最常见的触发场景：为了便于整体搬运/清理，插件把一个按钮包在自己的 wrapper `div` 里，然后把
+**wrapper**（而不是按钮本身）塞进宿主的 flex 容器；为了让按钮仍然表现得像是该 flex 容器的直接
+子项，就给 wrapper 加了 `display: contents`。
+
+**先去读宿主容器的真实 CSS，再决定替换成什么** —— 别凭印象猜它是不是 flex。Obsidian 自己的
+`app.css` 可以从当前实际运行的版本里抽出来（注意 `/Applications/Obsidian.app` 里那份往往是
+安装器的旧版本，自动更新后真正在跑的是 `~/Library/Application Support/obsidian/obsidian-<ver>.asar`）：
+
+```bash
+ls ~/Library/Application\ Support/obsidian/*.asar          # 找到真正在运行的版本
+npx --yes @electron/asar extract-file \
+  ~/Library/Application\ Support/obsidian/obsidian-1.13.7.asar app.css
+grep -n '\.embed-actions' -A 12 app.css                    # 读宿主容器的 display / gap
+```
+
+（抽出来的 `app.css` 放在 scratchpad 里，**绝不要落进插件仓库** —— 见上面
+「Repo hygiene: do not track Obsidian's CSS in the plugin repo」，一旦被 git 跟踪，
+bot 会把这两万行里的所有违规都算到你的提交头上。）
+
+如果宿主是 `display: flex`（Obsidian 1.13 的 `.embed-actions` 就是 `display:flex` + `gap`），
+把 wrapper 自己改成 `display: flex` 即可 —— 单个子按钮本身也是 flex 盒子，外面套一层
+shrink-to-fit 的 flex 容器，排版结果与"wrapper 不生成盒子"完全一致，间距照样由宿主的 `gap` 统一负责：
+
+```css
+/* ❌ — 触发 css-display-contents */
+.embed-actions > .plugin-image-setting-outer { display: contents; }
+
+/* ✅ — wrapper 变成一个恰好包住按钮的 flex 子项，视觉零差异 */
+.embed-actions > .plugin-image-setting-outer { display: flex; }
+```
+
+**改完顺手清理因 `display: contents` 而存在的 JS 绕行代码和注释。** `display: contents` 的元素
+`getBoundingClientRect()` 恒为全 0，代码里往往留有"必须取内层按钮而不是 wrapper，否则弹层会被
+定位到视口外"这类注释甚至 workaround —— 换成 `display: flex` 后 wrapper 有了真实盒子，这些注释
+就是错的。`grep -rn 'display: *contents\|contents' src/` 找一遍引用，把理由改写成当前成立的那个
+（例如"wrapper 的盒子边界不等于按钮，弹层要贴按钮下沿所以仍取按钮"），不要留着过期解释。
+
+> 宿主不是 flex 而是普通行内流时，用 `display: inline-flex`：在 flex 容器里它会被 blockify 成
+> `flex`，两种上下文都安全。不确定就按上面的方法把宿主 CSS 抽出来看一眼。
 
 ## Checking CSS for unknown type selectors
 
@@ -1507,7 +1779,7 @@ Obsidian submission bot 对插件行为按三个级别分类：**Warning**（会
 | Warning | Direct Filesystem Access | `import * as fs from 'fs'`、`import { readFileSync } from 'fs'` | 对 vault 内路径改用 `app.vault.adapter`（`write`、`writeBinary`、`mkdir`）；对 vault 外路径（用户配置的导出路径等）`fs` 是唯一选项，需在注释中说明意图 |
 | Warning | Shell Execution | `import { exec } from 'child_process'`、`require('child_process')` | 无法接受——移除；若确实必要需充分说明 |
 | Warning | System Identity Information | `os.hostname()`、`os.userInfo()`、`os.networkInterfaces()`、身份相关环境变量读取 | 可能被用于设备指纹识别，审核会重点关注；直接调用应移除或说明用途——常见根因见下方专节 |
-| Recommendation | Vault Enumeration | `vault.getFiles()`、`vault.getMarkdownFiles()`、`vault.getAllLoadedFiles()` | 通常为必要功能（链接解析、搜索）；确认范围最小化，无需移除 |
+| Recommendation | Vault Enumeration | `vault.getFiles()`、`vault.getMarkdownFiles()`、`vault.getAllLoadedFiles()` | 通常为必要功能（链接解析、搜索）；把循环范围收到实际需要的那一类文件即可，不必移除——详见下方专节 |
 | Recommendation | Clipboard Access | `navigator.clipboard.writeText()`、`navigator.clipboard.readText()` | 通常为 UX 功能（复制链接、代码块）；确认只在用户触发时调用，无需移除 |
 | Pass | Vault Read | `vault.read()`、`vault.cachedRead()` | 无需处理 |
 
@@ -1559,6 +1831,54 @@ grep -rln "os\.networkInterfaces\|os\.hostname\|os\.userInfo" src/
 
 修复前务必确认返回值确实不影响功能（读一下上游依赖里这个值的实际用途），并在代码注释里说明"为什么固定值也正确"，而不是简单删除注释了事。
 
+### Recommendation: Vault Enumeration —— 收窄范围，不要为了消除它重写数据格式
+
+这条是 **Recommendation**（知悉即可，不阻断发布），bot 原文只是陈述事实："Enumerates all files in
+the vault (`vault.getFiles`) — gives the plugin access to every file path in the vault."
+**它不要求你删掉这个调用**，要求的是"范围最小化"。判断顺序：
+
+1. **这个功能真的需要"vault 里有哪些文件"这一信息吗？** 如果只是为了拿某个已知路径的文件，
+   改用 `vault.getAbstractFileByPath()` / `getFileByPath()`，枚举就地消失，这是最好的结果。
+2. **需要，但只关心某一类文件？** 在循环里第一行就按扩展名/路径前缀过滤掉其余文件，并在注释里
+   写明"为什么只需要这一类"。这就是 bot 想看到的"范围最小化"。
+3. **需要全量、且没有等价 API？** 保留，在报告里标 `[KEPT: reason]`。
+
+⚠️ **不要用"手动递归遍历 `vault.getRoot().children`"来绕过这条。** 那是同一份数据、同一份权限，
+只是躲开了 bot 的 grep 模式 —— 属于欺骗检测器而非修复问题，人工复审一眼就能看穿。
+
+⚠️ **也不要为了消除它去重写缓存/索引的数据格式。** 实测案例（**obsidian-image-cluster**，
+2026-08-15）：`pruneOrphanedThumbnailCache` 需要"删掉所有不再对应任何原图的缩略图缓存"，缓存
+文件名是 `md5(原图路径@分辨率)` —— **单向不可逆**，无法从缓存文件反推原图路径去逐个校验存在性，
+只能反过来枚举原图、算出全部合法缓存名。当时评估过两个"彻底移除枚举"的方案，两个都被否决：
+
+| 方案 | 为什么否决 |
+|------|-----------|
+| 把 md5 换成可逆编码（base64url of path），从缓存文件名反解原图路径 | 改变缓存命名格式 → 所有存量用户的缓存全部失效重建；且把 vault 路径结构明文暴露在文件名里；长路径还有 255 字节文件名上限风险 |
+| 维护一份 `thumbPath → 原图路径` 的持久化索引 | 新增一份必须与真实文件保持同步的状态；索引丢失/未迁移时全部缓存会被误判为孤儿而清空 |
+
+为了一条不阻断发布的 Recommendation 承担"清空全体用户缓存"的迁移风险，是明显划不来的交换。
+最终采用方案 2（收窄范围）：只枚举图片文件，笔记和其他附件的路径根本不读。
+
+```typescript
+// ❌ — 枚举 vault 全部文件，对每个都算一遍缓存名
+for (const file of plugin.app.vault.getFiles()) {
+  if (file.path.startsWith(config.THUMBNAIL_PATH)) continue;
+  validThumbPaths.add(getThumbPath(file.path));
+}
+
+// ✅ — 第一行就把范围收到"只有图片"，并注释清楚漏判的后果是安全的
+const IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "jpeg", "jpg", "png", "svg", "webp"]);
+for (const file of plugin.app.vault.getFiles()) {
+  if (!IMAGE_EXTENSIONS.has(file.extension.toLowerCase())) continue;   // 笔记/其他附件永远没有缩略图
+  if (file.path.startsWith(config.THUMBNAIL_PATH)) continue;
+  validThumbPaths.add(getThumbPath(file.path));
+}
+```
+
+**收窄时务必确认"漏判"的后果是安全的**，并把这个论证写进注释 —— 上例中漏掉某种未列出的图片格式，
+后果只是它的缓存被当成孤儿删掉、下次渲染重新生成，不丢数据；如果漏判会导致数据丢失，那就不能
+用扩展名白名单这种"宁可错杀"的过滤方式。
+
 ### Warning: Direct Filesystem Access 的修复决策
 
 ```typescript
@@ -1588,6 +1908,38 @@ This command **pushes a tag**, which is a shared, hard-to-reverse action that ki
 automation — confirm the resolved version number and target commit with the user before the final
 push (step 4), per the general git-safety rules: never force-push, never skip hooks, and only push
 what this workflow explicitly calls for.
+
+### Step 0 — Preflight: the release must be based on `main`
+
+**Run this before anything else.** The release does not have to be cut from a checkout that is
+literally on `main`, but the commit that gets tagged **must already be on `main`** — every later step
+is irreversible in a shared way, and a tag pointing at a commit that never reached the default branch
+makes `manifest.json`'s public version describe code nobody can see on `main` (untangling that means
+deleting a published release and a pushed tag).
+
+```bash
+git rev-parse --abbrev-ref HEAD
+git fetch origin main --quiet
+git rev-list --left-right --count origin/main...HEAD    # "<behind>	<ahead>"
+```
+
+Evaluate:
+
+- **Current branch is `main`** — nothing to note, proceed.
+- **Current branch is not `main`** (feature branch, worktree branch, detached `HEAD`, …) — **just tell
+  the user** which branch they are on and that the release will be cut from it. This is a notice, not
+  a blocker: proceed to the next check.
+- **`HEAD` is *ahead* of `origin/main`** (the `ahead` count is non-zero) — those commits are not on the
+  default branch yet, so tagging here would publish code that never landed on `main`. **Stop and ask
+  the user** to land the work on `main` first (the `/merge-main` skill does exactly that for the
+  current branch), or to confirm explicitly that they want the tag cut from these un-merged commits
+  anyway. Do not decide this yourself.
+- **`HEAD` is *behind* `origin/main`** (the `behind` count is non-zero) — the checkout is missing
+  commits that are already on `main`; the release would be stale. Tell the user and let them decide
+  whether to update first.
+
+Do not work around any of this by switching or merging branches yourself — checking out or merging
+`main` on the user's behalf is a separate decision that belongs to them.
 
 ### Step 1 — Commit outstanding work (skip if clean)
 
@@ -1667,10 +2019,23 @@ silently.
 
 ### Step 4 — Push and hand off to CI
 
+The version-bump commit has to reach `origin/main` — that is the commit the tag points at, and Step 0
+requires the released commit to be on the default branch.
+
 ```bash
-git push origin HEAD    # the version-bump commit, so main doesn't diverge from what's tagged
+# On main:
+git push origin HEAD              # pushes the bump commit to main
+
+# On a feature/worktree branch that Step 0 confirmed is level with origin/main:
+git push origin HEAD:main         # fast-forwards main to include the bump commit
+git branch -f main HEAD 2>/dev/null || true   # keep local main in sync if it exists
+
 git push origin "$NEW_VERSION"
 ```
+
+If Step 0 surfaced that `HEAD` is ahead of `origin/main` and the user chose to release anyway, push
+whatever they agreed to (their feature branch, or `HEAD:main`) — do not silently fast-forward `main`
+past commits they have not signed off on.
 
 Pushing the tag is what triggers the release pipeline (e.g. a GitHub Actions workflow gated on
 `on: push: tags:`, see [Release 工作流检查（GitHub Actions）](#release-工作流检查github-actions) and
