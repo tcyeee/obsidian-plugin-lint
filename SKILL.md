@@ -1,6 +1,6 @@
 ---
 name: obsidian-plugin-lint
-description: 'Use when asked to lint, check, or review an Obsidian plugin''s CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate", "Unexpected browser feature", "Unexpected unknown type selector", "Unsafe assignment to innerHTML", "Sets styles directly instead of using CSS classes", "Unsafe call of an error or any typed value", "Unsafe member access on an error or any typed value", "Unsafe assignment of an error or any typed value", "Passes unsafe values into typed parameters", "This assertion is unnecessary since the receiver accepts the original type of the expression", "This assertion is unnecessary since it does not change the type of the expression", "overrides all other types in this union type", "display is deprecated", "Use getSettingDefinitions instead", "does not implement getSettingDefinitions", "will not appear in Obsidian''s settings search", "Creating and attaching "style" elements is not allowed", "Uses Obsidian APIs newer than the declared minAppVersion". Also handles the "/obsidian-plugin-publish [version]" release workflow — commit outstanding work, generate version.md from git history since the last release tag, bump manifest.json/package.json, tag, and push to trigger the release pipeline. Triggers on "/obsidian-plugin-publish", "发布插件", "打个 release", "bump version and tag".'
+description: 'Use when asked to lint, check, or review an Obsidian plugin''s CSS or code for style violations. Triggers on "lint", "检查代码", "check styles", before committing/releasing a plugin, or when seeing submission bot warnings: "Avoid !important", "Use the full 6-digit hex format", "Unexpected duplicate", "Unexpected browser feature", "Unexpected unknown type selector", "Unsafe assignment to innerHTML", "Sets styles directly instead of using CSS classes", "Unsafe call of an error or any typed value", "Unsafe member access on an error or any typed value", "Unsafe assignment of an error or any typed value", "Passes unsafe values into typed parameters", "This assertion is unnecessary since the receiver accepts the original type of the expression", "This assertion is unnecessary since it does not change the type of the expression", "overrides all other types in this union type", "display is deprecated", "Use getSettingDefinitions instead", "does not implement getSettingDefinitions", "will not appear in Obsidian''s settings search", "Creating and attaching "style" elements is not allowed", "Uses Obsidian APIs newer than the declared minAppVersion", "Avoid unnecessary logging to console", "Obsidian''s configuration folder is not necessarily .obsidian", "Use Vault#configDir to get the current value", "is defined but never used", "Use ''FileManager.trashFile()'' instead of ''Vault.trash()''", "setWarning is deprecated", "builtin-modules" should be replaced with an alternative package". Also handles the "/obsidian-plugin-publish [version]" release workflow — commit outstanding work, generate version.md from git history since the last release tag, bump manifest.json/package.json, tag, and push to trigger the release pipeline. Triggers on "/obsidian-plugin-publish", "发布插件", "打个 release", "bump version and tag".'
 model: haiku
 ---
 
@@ -26,6 +26,8 @@ Source: https://github.com/obsidianmd/eslint-plugin
 | No `innerHTML` | Any `el.innerHTML = ...` assignment (not just user input) | Use `el.createEl()`, `el.createDiv()`, `el.setText()` — innerHTML is unsafe regardless of source |
 | Use `this.app` | `window.app` or global `app` | Replace with `this.app` |
 | `normalizePath()` | User-defined paths passed to Vault API without normalizing | Wrap with `normalizePath()` from `obsidian` |
+| No console logging | `console.log`/`console.info` left in for routine, non-error events | Remove it; keep `console.error`/`console.warn` only for failures a bug report would need to diagnose |
+| Don't hardcode `.obsidian` | A literal `".obsidian"` path segment building a config-folder path | Use `Vault#configDir` (`this.app.vault.configDir`) — the user can rename this folder |
 
 ### CSS Best Practices (official docs recommendation, not enforced by eslint-plugin)
 
@@ -49,8 +51,62 @@ grep -n '!important' styles.css
 
 For each hit:
 
-1. Try adding `.workspace` as parent — outranks Obsidian's base rules (which don't use `!important` on these properties)
-2. If Obsidian itself uses `!important` on the same property, keep it and document why
+1. **First compute specificity instead of guessing** — before adding a `.workspace` prefix, check whether the existing selector *already* outranks every competing Obsidian rule on that property. Count (id, class, type) per selector (`:is()`/`:not()` contribute the specificity of their most specific argument, not an extra level) and compare against the native rules in `app.css` touching the same property/element. If the plugin's selector is already higher, `!important` is simply unused weight — drop it with no other change.
+2. If it is *not* already higher, add `.workspace` as parent (or another real ancestor class) — outranks Obsidian's base rules (which don't use `!important` on these properties)
+3. If Obsidian itself uses `!important` on the same property, keep it and document why
+
+**Worked example (obsidian-minimalism-ui, 2026-11-06)** — `!important` added defensively in a ribbon-hiding fix, flagged by the submission bot:
+
+```css
+/* Before */
+body.minimalism-ui-mac-sidebar .workspace-ribbon.side-dock-ribbon:is(.mod-left, .mod-primary) {
+	display: none !important;
+}
+```
+
+Competing native rules in `app.css`:
+
+| Selector | Specificity (id, class, type) |
+|---|---|
+| `.workspace-ribbon { display: flex; }` | (0,1,0) |
+| `body:not(.show-ribbon) .workspace-ribbon { display: none; }` | (0,2,1) |
+| Plugin's selector (4 classes incl. `:is()`, + `body`) | **(0,4,1)** |
+
+The plugin's selector already outranks both native rules without `!important` — neither native rule uses `!important` either, so specificity alone decides it regardless of which state (`show-ribbon` present or not) the body is in:
+
+```css
+/* After — same selector, just drop !important */
+body.minimalism-ui-mac-sidebar .workspace-ribbon.side-dock-ribbon:is(.mod-left, .mod-primary) {
+	display: none;
+}
+```
+
+Only reach for `.workspace`-prefixing or keeping `!important` when the specificity table actually shows the plugin's selector losing.
+
+**Worked example (obsidian-better-link-display, 2026-11-11)** — overriding a `<button>` element's background without `!important`. A hand-rolled segmented control styled a `<button class="…-radio">`; Obsidian's own button rules carry a type selector (`button`) plus theme classes, which outranks a bare class selector:
+
+```css
+/* Before — loses to Obsidian's button background, so !important papers over it */
+.my-plugin-radio {
+	background: transparent !important;
+}
+.my-plugin-radio:hover {
+	background: transparent !important;
+}
+
+/* After — match the same shape: ancestor class + `button` type selector, and
+   spell the :hover state out explicitly rather than relying on it to inherit
+   from the base rule — Obsidian's own button:hover rule is also more specific
+   than a lone class, so the override needs to win at that state too */
+.my-plugin-panel button.my-plugin-radio {
+	background: transparent;
+}
+.my-plugin-panel button.my-plugin-radio:hover {
+	background: transparent;
+}
+```
+
+Adding the real parent class (not `.workspace`, which wouldn't exist over a plugin's own panel) and the `button` type selector raises the selector's specificity past Obsidian's, with no `!important` needed.
 
 Applies to all properties (`display`, `pointer-events`, `overflow`, `overflow-y`, etc.):
 
@@ -537,6 +593,73 @@ window.requestAnimationFrame(() => layout());
 if (node.instanceOf(Element)) { /* ... */ }
 ```
 
+## Checking for unnecessary console logging
+
+**Submission bot warning:** `Avoid unnecessary logging to console` — https://docs.obsidian.md/Plugins/Releasing/Plugin+guidelines#Avoid+unnecessary+logging+to+console
+
+```bash
+grep -n "console\.\(log\|info\|debug\)" src/*.ts main.ts
+```
+
+The guideline targets *routine* logging — a line that fires on every normal call, not just on failure. `console.error`/`console.warn` for an actual failure (one the developer console needs so a bug report is diagnosable) are not what this flags; only remove those if the call site has no error to report.
+
+```typescript
+// ❌ — fires on every request, tells the developer nothing they couldn't already infer
+export function logInfo(message: string, detail?: unknown): void {
+	console.info(`${PREFIX} ${message}`, detail);
+}
+logInfo(`requesting ${endpoint}`);
+
+// ✅ — delete the info-level logger and its call sites entirely; keep warn/error
+// for the failure branches that still need a diagnosable console trail
+```
+
+If a logging helper (like a `logInfo` wrapper) ends up with no remaining callers after deleting the routine calls, delete the helper too rather than leaving dead code behind.
+
+## Checking for hardcoded `.obsidian` config directory
+
+**Submission bot warning:** `Obsidian's configuration folder is not necessarily .obsidian, it can be configured by the user. Use Vault#configDir to get the current value`
+
+```bash
+grep -n '"\.obsidian' src/*.ts main.ts
+grep -n "'\.obsidian" src/*.ts main.ts
+```
+
+Users can rename the hidden config folder in Obsidian's settings, so any path built with a literal `.obsidian` segment silently breaks for them. Build it from `Vault#configDir` instead:
+
+```typescript
+// ❌ — assumes the config folder is always named ".obsidian"
+const DEFAULT_CACHE_DIR = ".obsidian/plugins/my-plugin/cache";
+
+// ✅ — a function of the actual configDir, read from the running vault
+function defaultCacheDir(configDir: string): string {
+	return `${configDir}/plugins/my-plugin/cache`;
+}
+// called as defaultCacheDir(this.app.vault.configDir)
+```
+
+Where the hardcoded path was a module-level constant computed before any `App` instance existed (e.g. a settings-defaults factory), turn it into a function that takes `configDir` as a parameter and thread `this.app.vault.configDir` through from every call site — including the plugin's own `onload`/`loadSettings` and any settings-tab fallback that rebuilds the default when a user-editable field is cleared.
+
+## Checking for `Vault.trash()` instead of `FileManager.trashFile()`
+
+**Submission bot warning:** `Use 'FileManager.trashFile()' instead of 'Vault.trash()' to respect the user's file deletion preference.`
+
+```bash
+grep -n "vault\.trash(" src/*.ts main.ts
+```
+
+`Vault.trash(file, system)` only gives a binary choice — pass `system: true` for the OS trash, `false` for `.trash` inside the vault — and ignores whatever the user actually configured in Settings → Files & Links → "Deleted files". `FileManager.trashFile(file)` reads that setting itself (system trash / vault trash / permanent delete) and does the right thing, so any plugin-initiated delete should go through it:
+
+```typescript
+// ❌ — hardcodes "system trash", ignoring the user's configured deletion behavior
+await app.vault.trash(file, true);
+
+// ✅ — defers to Settings → Files & Links → "Deleted files"
+await app.fileManager.trashFile(file);
+```
+
+`FileManager.trashFile` requires Obsidian **1.6.6** (`no-unsupported-api` fires below that) — if `manifest.json`'s `minAppVersion` is older, this is the same "fix the API vs. raise the floor" tradeoff as the `getSettingDefinitions()` migration below: either bump `minAppVersion` to `1.6.6`+ (and `versions.json`'s entry for the next release) and switch the call, or confirm with the maintainer that keeping `Vault.trash()` at the current `minAppVersion` is acceptable and leave the Warning unaddressed (it's non-blocking). Don't silently keep `Vault.trash()` while claiming the bot finding is fixed — a stale comment explaining "why not trashFile" (like the one this rule was discovered from, which cited a `minAppVersion` that no longer matched reality once the floor had already moved for other reasons) is worse than no comment, because the next person trusts it instead of re-checking.
+
 ## TypeScript 类型安全
 
 ### `unknown` 与其他类型组成联合类型 → `no-redundant-type-constituents`
@@ -614,6 +737,18 @@ const parsed: unknown = parseYaml(trimmed);
 if (parsed && typeof parsed === "object") return parsed as BlockConfig;
 ```
 
+`JSON.parse()`（如读取 vault adapter 上缓存的 JSON 文件）是完全同样的模式——返回值是 `any`，直接赋值给 `const` 就触发 `no-unsafe-assignment`，即使后面只是喂给一个 `value is T` 类型守卫：
+
+```typescript
+// ❌ — Unsafe assignment of an `any` value
+const parsed = JSON.parse(await adapter.read(path));
+this.cache = isValidShape(parsed) ? parsed : {};
+
+// ✅ 标注为 unknown——类型守卫本来就接受 unknown，不需要额外断言
+const parsed: unknown = JSON.parse(await adapter.read(path));
+this.cache = isValidShape(parsed) ? parsed : {};
+```
+
 ### `.bind()` / `.call()` / `.apply()` 返回 `any` → 开 `strictBindCallApply`
 
 未开 `strictBindCallApply` 时，`Function.prototype.bind` 的类型签名返回 `any`，于是 `const f = obj.method.bind(obj)` 整条链都变 `any`，引发一整簇 `no-unsafe-assignment` / `no-unsafe-call` / `no-unsafe-argument`（最常见于 monkey-patch：保存原方法 → 调用 → 存进 Map）。逐处加断言治标不治本——**根因在 tsconfig**。
@@ -683,6 +818,18 @@ const zip = zipSync(files, { level: 6 });
 ```
 
 不确定库的真实返回类型时，别猜——直接查 `node_modules/<pkg>/**/*.d.ts` 里的函数签名，或用 TS 官方 API 现场核实（见下方"核实陈旧报告"）。
+
+**同类陷阱的 Obsidian 官方 API 版本（实测案例，obsidian-minimalism-ui，2026-11-06）**：`leaf.getViewState().state as Record<string, unknown> | undefined` 这类写法，先查 `node_modules/obsidian/obsidian.d.ts` 里 `ViewState` 接口的 `state` 字段声明——它本身就是 `state?: Record<string, unknown>`，断言目标与官方声明完全一致，断言不改变任何类型，直接删掉：
+
+```typescript
+// ❌ — ViewState.state 在 obsidian.d.ts 里已声明为 Record<string, unknown> | undefined
+const state = leaf.getViewState().state as Record<string, unknown> | undefined;
+
+// ✅
+const state = leaf.getViewState().state;
+```
+
+遇到类似断言，先 `grep -n "interface ViewState" -A5 node_modules/obsidian/obsidian.d.ts`（或任意涉及的 Obsidian 接口）核实官方字段类型，而不是假设它是 `any` 后去猜断言是否必要。
 
 **⚠️ 第三类陷阱——`as` 断言本身就是让类型"看起来不需要断言"的原因，删掉后类型会真的变宽（实测案例，obsidian-image-cluster，2026-07-10）**：`Element.prototype.closest<E extends Element = Element>(selectors: string): E | null` 是泛型方法，`E` 默认收窄为 `Element`。当写成 `el.closest(".cm-editor") as HTMLElement | null` 时，TypeScript 会把 `as` 右边的类型当作**上下文类型**反向喂给 `closest<E>` 的泛型推断（这是 TS 对括在 `as` 里的表达式做上下文类型标注的通用行为，不是 `closest` 特有的），于是 `E` 被推成 `HTMLElement`——断言写出来之后，表达式自己的类型就已经等于断言目标，`no-unnecessary-type-assertion` 因此判定"断言不改变类型"而报多余。**但这是循环论证式的假象**：断言之所以"不改变类型"，恰恰是因为断言本身才是让 `E` 被推成 `HTMLElement` 的原因——按标准做法直接删掉 `as`，`E` 会失去这个上下文提示，退回默认值 `Element`，类型真的变宽了：
 
@@ -1026,6 +1173,18 @@ function render(file: TFile, config: Config) { /* config never used */ }
 // ✅
 function render(file: TFile, _config: Config) { }
 ```
+
+**未使用的 import** 是不同情况——报告原文同样是 `'x' is defined but never used`，但 `_` 前缀对 import 绑定不适用（重命名绑定要求同步改掉所有引用，等于手动做死代码删除的反面）。确认该导出确实在本文件无引用后，直接删掉这一个 import 名字，而不是改名：
+
+```typescript
+// ❌ — normalizeAppGridUrl exported from appGridScan but never called in this file
+import { buildAppGridInsertion, normalizeAppGridUrl, parseAppGridConfig } from "./appGridScan";
+
+// ✅
+import { buildAppGridInsertion, parseAppGridConfig } from "./appGridScan";
+```
+
+删除前用 `grep -rn "normalizeAppGridUrl" src/` 确认该符号在别的文件里仍有用到（比如被另一个模块导入使用）——只删这一处未使用的 import，不要动它的定义或其他文件里的合法引用。
 
 ```bash
 grep -n "is defined but never used" # 来自 eslint 输出
