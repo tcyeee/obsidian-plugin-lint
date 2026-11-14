@@ -1516,6 +1516,7 @@ overrides:
 | 字段 | 违规 | Fix |
 |------|------|-----|
 | `description` | 以插件名开头（如 `"Image Cluster helps you..."`) | 直接描述功能，去掉开头的插件名 |
+| `description` | 包含 "Obsidian" 一词 | 删除该词——由插件目录的上下文隐含，写出来是多余的 |
 | `minAppVersion` | 低于代码中实际使用的 API 所需版本 | 升高 `minAppVersion` 至 API 要求的最低版本 |
 
 **Release tag 严禁加 `v` 前缀**：Obsidian 官方明确要求 GitHub Release 的 tag 必须与
@@ -1599,6 +1600,16 @@ button.setButtonText(t("token.testing"));   // setButtonText 是 @since 0.9.7，
 ```
 
 检查方法：`cat manifest.json` 查看 `description` 字段是否以插件 `name` 开头。
+
+```json
+// ❌
+"description": "A simple and powerful todo plugin for Obsidian."
+
+// ✅
+"description": "A simple and powerful todo plugin."
+```
+
+检查方法：`cat manifest.json` 查看 `description` 字段是否包含 "Obsidian"（大小写不敏感）——该词在插件目录上下文中是冗余信息。
 
 ## Release 工作流检查（GitHub Actions）
 
